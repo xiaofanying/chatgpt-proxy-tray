@@ -10,6 +10,12 @@
 - 企业 VPN / 系统代理设置零冲突；
 - 托盘实时显示代理是否生效，并能检测「疑似直连」的连接。
 
+## 下载即用（Release）
+
+不想自己编译的话，直接到 [Releases](https://github.com/xiaofanying/chatgpt-proxy-tray/releases/latest) 下载 `ChatGptProxyTray-v1.1.0-win-x64.zip`，解压后运行里面的 `ChatGptProxyTray.exe` 即可（绿色便携，不需要安装，也不写系统目录）。
+
+> exe 未做代码签名，首次运行可能被 SmartScreen 提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」；如果还是被拦，先在 PowerShell 里执行 `Unblock-File .\ChatGptProxyTray.exe` 再运行。
+
 ## 环境要求
 
 - Windows 10/11 x64
