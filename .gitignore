@@ -18,3 +18,8 @@ _patch.ps1
 .vscode/
 *.user
 *.suo
+
+# 开发用截图工具产物
+tools/capture.exe
+tools/capture.log
+tools/config.ini

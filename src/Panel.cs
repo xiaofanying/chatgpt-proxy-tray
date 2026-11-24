@@ -146,7 +146,11 @@ namespace ChatGptProxyTray
             if (report.HasLeak) connections += "   ⚠ " + string.Join(", ", report.DirectRemotes.ToArray());
             _labelConnections.Text = connections;
 
-            if (clash == null)
+            if (!cfg.ClashEnabled)
+            {
+                _labelClash.Text = "Clash 联动: 已关闭（config.ini [clash] enabled=true 可开启）";
+            }
+            else if (clash == null)
             {
                 _labelClash.Text = "Clash: 尚未检测";
             }
@@ -174,10 +178,18 @@ namespace ChatGptProxyTray
 
         private void LoadConnections(bool force)
         {
+            AppConfig cfg = _context.Config;
+            if (!cfg.ClashEnabled)
+            {
+                _loadingConnections = false;
+                _lastConnectionsAt = DateTime.UtcNow;
+                _list.Items.Clear();
+                _labelStatus.Text = "Clash 联动已关闭（config.ini [clash] enabled=true 可查看连接与规则命中）";
+                return;
+            }
             if (_loadingConnections) return;
             if (!force && (DateTime.UtcNow - _lastConnectionsAt).TotalSeconds < 5) return;
             _loadingConnections = true;
-            AppConfig cfg = _context.Config;
 
             ThreadPool.QueueUserWorkItem(delegate
             {

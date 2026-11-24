@@ -1,0 +1,39 @@
+name: 功能建议
+description: 希望增加的能力或使用体验改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个工具刻意保持「小而专注」：只让 ChatGPT 桌面版走 Clash，不引入驱动、服务和全局接管。提建议前请先看一下 README 的「已知限制」，并说明你的实际场景。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      placeholder: 你遇到什么问题？现有功能为什么不够用？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的方案
+      placeholder: 你希望工具怎么工作？如果是菜单/CLI/配置项，也请描述交互。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+      placeholder: 例如系统代理、Clash TUN、Proxifier、手工设置环境变量等
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 范围确认
+      options:
+        - label: 我知道本工具目前刻意不做 TUN / 防火墙 / 驱动级强制接管（需要绝对强制时应在 Clash 侧配置）
+          required: false

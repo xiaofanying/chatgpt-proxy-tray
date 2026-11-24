@@ -1,0 +1,68 @@
+name: Bug 反馈
+description: 报告程序无法启动、代理不生效、状态误报等问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！为了更快定位问题，建议附上诊断信息：托盘菜单 →「生成诊断报告」，把程序目录下 `diag\diag-*.txt` 的内容粘贴进来（报告只包含配置、进程、连接和日志，不含聊天内容）。
+
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本
+      placeholder: 例如 1.1.0（exe 属性 → 详细信息，或托盘菜单）
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: 例如 Windows 11 24H2 26100
+    validations:
+      required: true
+
+  - type: input
+    id: clash
+    attributes:
+      label: Clash 客户端与端口
+      placeholder: 例如 Clash Verge 2.5.10，混合端口 127.0.0.1:7897
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 启动 Clash，确认 127.0.0.1:7897 可用
+        2. 运行 ChatGptProxyTray.exe
+        3. 右键 →「启动 ChatGPT（走代理）」
+        4. 看到的状态是 …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      placeholder: 例如托盘变绿、`--status` 显示 Proxied
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果 / 报错信息
+      placeholder: 例如 `--status` 输出、气泡提示、日志报错
+    validations:
+      required: true
+
+  - type: textarea
+    id: diag
+    attributes:
+      label: 诊断报告 / 日志
+      description: 可粘贴 `diag\diag-*.txt`，或 `logs\app.log` 最后几十行
+      render: text

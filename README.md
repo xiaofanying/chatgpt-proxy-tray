@@ -10,6 +10,20 @@
 - 企业 VPN / 系统代理设置零冲突；
 - 托盘实时显示代理是否生效，并能检测「疑似直连」的连接。
 
+**ChatGPT Proxy Tray** (English): a lightweight Windows tray app that routes **only** the ChatGPT desktop app (Microsoft Store MSIX package `OpenAI.Codex`) through your local Clash / mihomo proxy. It launches ChatGPT with Chromium `--proxy-server` flags and proxy environment variables, so the embedded `codex.exe` core inherits the proxy too; the tray icon reports whether traffic really goes through Clash and warns when ChatGPT is running unproxied. No TUN, no system proxy changes, no drivers, no admin rights. MIT licensed, portable single exe.
+
+## 截图
+
+以下为空白状态截图（ChatGPT 未运行、Clash 联动关闭，仅展示界面布局，不包含任何真实节点或连接信息）。
+
+**状态面板**：代理 / 应用状态、连接统计，以及 ChatGPT / codex 每条连接命中的规则和代理链（`--panel`、菜单「打开状态面板」或双击托盘图标）。
+
+![状态面板](docs/screenshots/panel.png)
+
+**托盘菜单**：启动 / 重启 / 关闭、守护模式、Clash 联动（模式 / 节点 / TUN）、开机自启、诊断报告。
+
+![托盘菜单](docs/screenshots/menu.png)
+
 ## 下载即用（Release）
 
 不想自己编译的话，直接到 [Releases](https://github.com/xiaofanying/chatgpt-proxy-tray/releases/latest) 下载 `ChatGptProxyTray-v1.1.0-win-x64.zip`，解压后运行里面的 `ChatGptProxyTray.exe` 即可（绿色便携，不需要安装，也不写系统目录）。
@@ -228,6 +242,9 @@ Codex_Proxy/
 ├─ test.ps1                     # 冒烟测试（编译/自检/状态/诊断/配置/自启/托盘/启动关闭）
 ├─ config.ini                   # 默认配置
 ├─ LICENSE                      # MIT 许可证
+├─ docs/screenshots/            # README 截图（panel.png / menu.png）
+├─ .github/ISSUE_TEMPLATE/      # issue 模板（bug / feature）
+├─ tools/CaptureMain.cs         # 开发用：重新生成 README 截图
 ├─ src/
 │  ├─ Native.cs                 # P/Invoke（AttachConsole/GetExtendedTcpTable/DestroyIcon…）
 │  ├─ AutoStart.cs              # 开机自启（HKCU Run）
