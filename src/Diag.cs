@@ -31,13 +31,15 @@ namespace ChatGptProxyTray
 
                 builder.AppendLine("== 配置 ==");
                 builder.AppendLine("文件: " + cfg.ConfigPath + (File.Exists(cfg.ConfigPath) ? "" : "（缺失，使用默认值）"));
-                builder.AppendLine("代理: " + cfg.BuildProxyUrl(cfg.ProxyPort) + "  verify_connect=" + cfg.VerifyConnect);
+                builder.AppendLine("代理: " + cfg.BuildProxyUrl(cfg.ProxyPort) + "  verify_connect=" + cfg.VerifyConnect + "  verify_host=" + cfg.VerifyHost);
                 builder.AppendLine("备选端口: " + JoinPorts(cfg.FallbackPorts));
                 builder.AppendLine("bypass_list: " + cfg.BypassList);
                 builder.AppendLine("no_proxy: " + cfg.NoProxy);
                 builder.AppendLine("目标: package=" + cfg.PackageName + "  alias=" + cfg.AliasName);
                 builder.AppendLine("  exe_path=" + cfg.ExePath + "  extra_args=" + cfg.ExtraArgs);
-                builder.AppendLine("Clash 联动: enabled=" + cfg.ClashEnabled + "  auto_launch=" + cfg.AutoLaunchOnClash + "  pipe_name=" + cfg.ClashPipeName);
+                builder.AppendLine("Clash 联动: enabled=" + cfg.ClashEnabled + "  auto_launch=" + cfg.AutoLaunchOnClash +
+                                   "  pipe_name=" + cfg.ClashPipeName + "  api_url=" + cfg.ClashApiUrl +
+                                   "  api_secret=" + (cfg.ClashApiSecret.Length > 0 ? "(已设置)" : ""));
                 builder.AppendLine("守护模式: enabled=" + cfg.GuardEnabled + "  auto_takeover=" + cfg.GuardAutoTakeover);
                 builder.AppendLine("界面: refresh=" + cfg.RefreshSeconds + "s  verify=" + cfg.VerifySeconds + "s");
                 builder.AppendLine("开机自启: " + (AutoStart.IsEnabled() ? "开：" + AutoStart.CommandLine() : "关"));
@@ -57,13 +59,12 @@ namespace ChatGptProxyTray
                 builder.AppendLine("疑似直连: " + (report.HasLeak ? string.Join(", ", report.DirectRemotes.ToArray()) : "无"));
                 builder.AppendLine();
 
-                List<TcpRow> rows = TcpTable.GetConnections();
                 builder.AppendLine("== 相关进程（" + report.Processes.Count + " 个） ==");
-                AppendProcesses(builder, report.Processes, rows);
+                AppendProcesses(builder, report);
                 builder.AppendLine();
 
                 builder.AppendLine("== 相关进程的 ESTABLISHED 连接（最多 40 条） ==");
-                AppendConnections(builder, report.Processes, rows);
+                AppendConnections(builder, report);
                 builder.AppendLine();
 
                 if (cfg.ClashEnabled)
@@ -72,7 +73,7 @@ namespace ChatGptProxyTray
                     ClashState clash = ClashApi.GetState(cfg);
                     if (clash.ApiAvailable)
                     {
-                        builder.AppendLine("API: 可用  管道=" + clash.PipeName);
+                        builder.AppendLine("API: 可用  通道=" + clash.EndpointDisplay);
                         builder.AppendLine("版本=" + clash.Version + "  mode=" + clash.Mode + "  tun=" + clash.TunEnabled + "  GLOBAL=" + clash.GlobalNow);
                         builder.AppendLine("策略组 " + clash.Groups.Count + " 个:");
                         for (int i = 0; i < clash.Groups.Count; i++)
@@ -103,8 +104,10 @@ namespace ChatGptProxyTray
             }
         }
 
-        private static void AppendProcesses(StringBuilder builder, List<ProcEntry> processes, List<TcpRow> rows)
+        private static void AppendProcesses(StringBuilder builder, StatusReport report)
         {
+            List<ProcEntry> processes = report.Processes;
+            List<TcpRow> rows = report.AppConnections;
             if (processes.Count == 0)
             {
                 builder.AppendLine("（没有 ChatGPT / codex 进程）");
@@ -114,15 +117,24 @@ namespace ChatGptProxyTray
             {
                 ProcEntry entry = processes[i];
                 int established = 0;
+                int proxied = 0;
                 int external = 0;
                 for (int j = 0; j < rows.Count; j++)
                 {
-                    if (rows[j].Pid != entry.Pid || rows[j].State != TcpStateEstablished) continue;
+                    TcpRow row = rows[j];
+                    if (row.Pid != entry.Pid || row.State != TcpStateEstablished) continue;
                     established++;
-                    if (!rows[j].IsLoopbackRemote()) external++;
+                    if (report.Proxy.PortOpen && StatusEvaluator.MatchesProxyEndpoint(row, report.Proxy.Port, report.ProxyAddresses))
+                    {
+                        proxied++;
+                    }
+                    else if (!row.IsLoopbackRemote())
+                    {
+                        external++;
+                    }
                 }
                 builder.AppendLine("- pid=" + entry.Pid + " ppid=" + entry.ParentPid + " " + entry.Name +
-                                   "  established=" + established + " 外部=" + external);
+                                   "  established=" + established + " 经代理=" + proxied + " 外部=" + external);
                 if (entry.CommandLine != null && entry.CommandLine.Length > 0)
                 {
                     builder.AppendLine("    cmd: " + Truncate(entry.CommandLine, 600));
@@ -130,15 +142,11 @@ namespace ChatGptProxyTray
             }
         }
 
-        private static void AppendConnections(StringBuilder builder, List<ProcEntry> processes, List<TcpRow> rows)
+        private static void AppendConnections(StringBuilder builder, StatusReport report)
         {
-            List<int> pids = new List<int>();
-            for (int i = 0; i < processes.Count; i++)
-            {
-                int pid = processes[i].Pid;
-                if (!pids.Contains(pid)) pids.Add(pid);
-            }
-            if (pids.Count == 0)
+            List<ProcEntry> processes = report.Processes;
+            List<TcpRow> rows = report.AppConnections;
+            if (processes.Count == 0)
             {
                 builder.AppendLine("（没有相关进程）");
                 return;
@@ -148,14 +156,18 @@ namespace ChatGptProxyTray
             for (int i = 0; i < rows.Count; i++)
             {
                 TcpRow row = rows[i];
-                if (row.State != TcpStateEstablished || !pids.Contains(row.Pid)) continue;
+                if (row.State != TcpStateEstablished) continue;
                 if (count >= 40)
                 {
                     builder.AppendLine("…（已截断）");
                     break;
                 }
+                string kind;
+                if (report.Proxy.PortOpen && StatusEvaluator.MatchesProxyEndpoint(row, report.Proxy.Port, report.ProxyAddresses)) kind = "经代理";
+                else if (row.IsLoopbackRemote()) kind = "本地";
+                else kind = "直连!";
                 builder.AppendLine("  pid=" + row.Pid + " " + row.LocalAddress + ":" + row.LocalPort +
-                                   " -> " + row.RemoteAddress + ":" + row.RemotePort);
+                                   " -> " + row.RemoteAddress + ":" + row.RemotePort + " [" + kind + "]");
                 count++;
             }
             if (count == 0) builder.AppendLine("（没有 ESTABLISHED 连接）");

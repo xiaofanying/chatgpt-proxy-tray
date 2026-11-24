@@ -9,12 +9,21 @@ namespace ChatGptProxyTray
 {
     internal static class Program
     {
+        private const string InstanceMutexName = @"Local\ChatGptProxyTray.SingleInstance";
         private static Mutex _instanceMutex;
+
+        private static bool IsCommandArg(string arg)
+        {
+            if (string.IsNullOrEmpty(arg)) return false;
+            return arg.StartsWith("--", StringComparison.Ordinal) ||
+                   string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(arg, "/?", StringComparison.Ordinal);
+        }
 
         [STAThread]
         private static void Main(string[] args)
         {
-            if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal))
+            if (args.Length > 0 && IsCommandArg(args[0]))
             {
                 int exitCode = 1;
                 try
@@ -36,11 +45,14 @@ namespace ChatGptProxyTray
             AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
 
             bool createdNew;
-            _instanceMutex = new Mutex(true, "ChatGptProxyTray.SingleInstance", out createdNew);
+            _instanceMutex = new Mutex(true, InstanceMutexName, out createdNew);
             if (!createdNew)
             {
-                // 已有实例在托盘中运行：静默退出，避免模态框阻塞（日志里留痕，方便排查）
-                Log.Info("检测到已有托盘实例，本次启动直接退出");
+                // 已有实例在托盘中运行：通知已有实例打开状态面板后退出，避免模态框阻塞
+                bool signaled = TrayContext.SignalExistingInstance();
+                Log.Info(signaled
+                    ? "检测到已有托盘实例，已通知打开状态面板，本次启动退出"
+                    : "检测到已有托盘实例，本次启动直接退出");
                 return;
             }
 
@@ -184,7 +196,7 @@ namespace ChatGptProxyTray
                 return 1;
             }
 
-            List<ProcEntry> processes = AppProcess.Query();
+            List<ProcEntry> processes = AppProcess.FilterLifecycleProcesses(AppProcess.Query());
             if (processes.Count > 0)
             {
                 if (!restart)
@@ -237,7 +249,7 @@ namespace ChatGptProxyTray
                 Emit(builder.ToString());
                 return 1;
             }
-            builder.AppendLine("API: 可用  管道=" + state.PipeName);
+            builder.AppendLine("API: 可用  通道=" + state.EndpointDisplay);
             builder.AppendLine("版本: " + state.Version);
             builder.AppendLine("模式: " + state.Mode + "（" + state.ModeText + "）");
             builder.AppendLine("TUN: " + (state.TunEnabled ? "开启" : "关闭"));
@@ -246,7 +258,7 @@ namespace ChatGptProxyTray
             for (int i = 0; i < state.Groups.Count; i++)
             {
                 ClashGroup group = state.Groups[i];
-                builder.AppendLine("  - " + group.Name + " → " + group.Now + "（" + group.Options.Count + " 项）");
+                builder.AppendLine("  - " + group.Name + " → " + state.FormatNodeWithDelay(group.Now) + "（" + group.Options.Count + " 项）");
             }
             Emit(builder.ToString());
             return 0;
@@ -299,7 +311,13 @@ namespace ChatGptProxyTray
                 Emit("用法: --clash-tun on|off");
                 return 2;
             }
-            bool enable = string.Equals(args[1], "on", StringComparison.OrdinalIgnoreCase) || args[1] == "1";
+            bool ok;
+            bool enable = ParseOnOff(args[1], out ok);
+            if (!ok)
+            {
+                Emit("参数错误: " + args[1] + "（可选 on/off）");
+                return 2;
+            }
             string error;
             if (!ClashApi.SetTun(cfg, enable, out error))
             {
@@ -317,7 +335,13 @@ namespace ChatGptProxyTray
                 Emit("用法: --clash-auto on|off");
                 return 2;
             }
-            bool enable = string.Equals(args[1], "on", StringComparison.OrdinalIgnoreCase) || args[1] == "1";
+            bool ok;
+            bool enable = ParseOnOff(args[1], out ok);
+            if (!ok)
+            {
+                Emit("参数错误: " + args[1] + "（可选 on/off）");
+                return 2;
+            }
             cfg.AutoLaunchOnClash = enable;
             if (!cfg.SetValue("clash", "auto_launch", enable ? "true" : "false"))
             {
@@ -330,14 +354,14 @@ namespace ChatGptProxyTray
 
         private static int CloseCommand(AppConfig cfg)
         {
-            List<ProcEntry> processes = AppProcess.Query();
+            List<ProcEntry> processes = AppProcess.FilterLifecycleProcesses(AppProcess.Query());
             if (processes.Count == 0)
             {
                 Emit("ChatGPT 未运行");
                 return 0;
             }
             bool ok = AppProcess.CloseAll(processes, 10000);
-            Emit("已关闭 ChatGPT（剩余相关进程 " + AppProcess.Query().Count + " 个）");
+            Emit("已关闭 ChatGPT（剩余相关进程 " + AppProcess.FilterLifecycleProcesses(AppProcess.Query()).Count + " 个）");
             return ok ? 0 : 1;
         }
 
@@ -454,7 +478,7 @@ namespace ChatGptProxyTray
             if (report.MainCommandLine.Length > 0) builder.AppendLine("根进程命令行: " + Shorten(report.MainCommandLine, 220));
 
             // 1) 进程级 TCP 连接：确认 ChatGPT 自己的 socket 到底连到了哪里
-            List<TcpRow> rows = TcpTable.GetConnections();
+            List<TcpRow> rows = report.AppConnections;
             Dictionary<int, string> names = new Dictionary<int, string>();
             for (int i = 0; i < report.Processes.Count; i++) names[report.Processes[i].Pid] = report.Processes[i].Name;
             builder.AppendLine("进程 ESTABLISHED 连接:");
@@ -467,7 +491,7 @@ namespace ChatGptProxyTray
                 if (!names.TryGetValue(row.Pid, out name)) continue;
                 if (shown >= 40) break;
                 string kind;
-                if (report.Proxy.PortOpen && row.RemotePort == report.Proxy.Port) kind = "经代理";
+                if (report.Proxy.PortOpen && StatusEvaluator.MatchesProxyEndpoint(row, report.Proxy.Port, report.ProxyAddresses)) kind = "经代理";
                 else if (row.IsLoopbackRemote()) kind = "本地";
                 else kind = "直连!";
                 builder.AppendLine("  " + name + " pid=" + row.Pid + " → " + row.RemoteAddress + ":" + row.RemotePort + " [" + kind + "]");
@@ -476,15 +500,18 @@ namespace ChatGptProxyTray
             if (shown == 0) builder.AppendLine("  （无；ChatGPT 未运行）");
 
             // 2) Clash 连接表：确认命中了哪条规则、走的是哪个节点
+            //    若 Clash 未开启 find-process-mode（metadata.process 为空），通过源端口反查进程
             string error;
             List<ClashConnection> connections = ClashApi.GetConnections(cfg, out error);
+            Dictionary<int, string> localPortMap = StatusEvaluator.BuildLocalPortProcessMap(report.Processes, TcpTable.GetConnections());
             builder.AppendLine("Clash /connections 命中（仅 ChatGPT / codex）:");
             int hits = 0;
             for (int i = 0; i < connections.Count; i++)
             {
                 ClashConnection connection = connections[i];
-                if (!IsAppProcessName(connection.Process)) continue;
-                builder.AppendLine("  " + connection.Process + "  " + connection.TargetText +
+                string processName = StatusEvaluator.ResolveConnectionProcess(connection, localPortMap);
+                if (string.IsNullOrEmpty(processName)) continue;
+                builder.AppendLine("  " + processName + "  " + connection.TargetText +
                                    "  规则=" + connection.RuleText +
                                    "  链路=" + connection.ChainText +
                                    "  上行=" + connection.Upload + "B 下行=" + connection.Download + "B");
@@ -497,13 +524,6 @@ namespace ChatGptProxyTray
 
             Emit(builder.ToString());
             return 0;
-        }
-
-        private static bool IsAppProcessName(string name)
-        {
-            if (string.IsNullOrEmpty(name)) return false;
-            return name.IndexOf("chatgpt", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   name.IndexOf("codex", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string Shorten(string text, int max)
@@ -521,10 +541,15 @@ namespace ChatGptProxyTray
             AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
 
             bool createdNew;
-            using (Mutex mutex = new Mutex(true, "ChatGptProxyTray.SingleInstance", out createdNew))
+            using (Mutex mutex = new Mutex(true, InstanceMutexName, out createdNew))
             {
                 if (!createdNew)
                 {
+                    if (TrayContext.SignalExistingInstance())
+                    {
+                        Emit("已唤醒正在运行的托盘状态面板。" + Environment.NewLine);
+                        return 0;
+                    }
                     Emit("已有托盘实例在运行，请在托盘菜单里打开「状态面板」。" + Environment.NewLine);
                     return 1;
                 }
@@ -615,15 +640,34 @@ namespace ChatGptProxyTray
         {
             try
             {
-                File.WriteAllText(LastResultPath(), text, Encoding.UTF8);
+                File.WriteAllText(LastResultPath(), text, new UTF8Encoding(false));
             }
             catch
             {
             }
 
+            if (Console.IsOutputRedirected)
+            {
+                try
+                {
+                    using (Stream stdout = Console.OpenStandardOutput())
+                    {
+                        byte[] bytes = Encoding.UTF8.GetBytes(text);
+                        stdout.Write(bytes, 0, bytes.Length);
+                        stdout.Flush();
+                    }
+                }
+                catch
+                {
+                }
+                return;
+            }
+
+            bool attached = false;
             try
             {
-                if (NativeMethods.AttachConsole(NativeMethods.AttachParentProcess))
+                attached = NativeMethods.AttachConsole(NativeMethods.AttachParentProcess);
+                if (attached)
                 {
                     try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                     using (StreamWriter writer = new StreamWriter(Console.OpenStandardOutput(), Encoding.UTF8))
@@ -638,7 +682,10 @@ namespace ChatGptProxyTray
             }
             finally
             {
-                try { NativeMethods.FreeConsole(); } catch { }
+                if (attached)
+                {
+                    try { NativeMethods.FreeConsole(); } catch { }
+                }
             }
         }
     }

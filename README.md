@@ -26,7 +26,7 @@
 
 ## 下载即用（Release）
 
-不想自己编译的话，直接到 [Releases](https://github.com/xiaofanying/chatgpt-proxy-tray/releases/latest) 下载 `ChatGptProxyTray-v1.1.0-win-x64.zip`，解压后运行里面的 `ChatGptProxyTray.exe` 即可（绿色便携，不需要安装，也不写系统目录）。
+不想自己编译的话，直接到 [Releases](https://github.com/xiaofanying/chatgpt-proxy-tray/releases/latest) 下载 `ChatGptProxyTray-v1.2.0-win-x64.zip`，解压后运行里面的 `ChatGptProxyTray.exe` 即可（绿色便携，不需要安装，也不写系统目录）。
 
 > exe 未做代码签名，首次运行可能被 SmartScreen 提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」；如果还是被拦，先在 PowerShell 里执行 `Unblock-File .\ChatGptProxyTray.exe` 再运行。
 
@@ -57,17 +57,16 @@ powershell -ExecutionPolicy Bypass -File .\test.ps1
 | --- | --- |
 | Clash：`http://127.0.0.1:7897` 可用 | 当前代理探测状态（含 CONNECT 出网验证） |
 | ChatGPT：已走代理（N 条经代理连接） | 当前应用状态 |
-| 启动 / 重启为代理（一个按钮智能切换） | ChatGPT 未运行时显示「启动 ChatGPT（走代理）」；检测到直连运行时自动变成「重启为代理」，点一下就关闭后以代理方式重启；已走代理时显示「ChatGPT 已走代理」且不可点 |
-| 关闭 ChatGPT | 关闭 ChatGPT 全部相关进程（会弹确认框，避免误点丢失正在生成的内容） |
-| 打开状态面板 | 双击托盘图标（单击不响应，避免误触）或点此打开：状态、连接与规则命中小窗 |
-| 立即接管为代理（重启 ChatGPT） | 检测到直连/端口不一致时可用：关闭后以代理方式重启 |
+| 启动 / 重启为代理（一个按钮智能切换） | ChatGPT 未运行时显示「启动 ChatGPT（走代理）」；检测到直连或端口不一致时自动变成「重启为代理（接管当前实例）」，点一下即关闭并以代理方式重启；已走代理时显示「ChatGPT 已走代理」且不可点 |
+| 关闭 ChatGPT | 关闭 ChatGPT / codex 全部相关进程（会弹确认框，避免误点丢失正在生成的内容） |
+| 打开状态面板 | 双击托盘图标（单击不响应，避免误触）或点此打开：支持缩放、高 DPI 与右键复制的状态/连接/规则命中窗口 |
 | 守护模式（发现直连时提示） | 勾选开关；ChatGPT 直连时弹气泡，点击气泡即接管 |
 | 发现直连时自动接管（重启为代理） | 勾选开关（默认关）；发现直连自动重启为代理，会中断当前会话 |
 | 开机自启（登录时启动托盘） | 勾选开关，写 `HKCU\...\Run`；不需要管理员 |
-| 生成诊断报告 | 生成 `diag\diag-*.txt` 并打开所在文件夹 |
-| Clash 联动 → 状态行 | mihomo 版本 / 代理模式 / TUN 状态（10 秒缓存） |
+| 生成诊断报告 | 后台生成 `diag\diag-*.txt` 并打开所在文件夹 |
+| Clash 联动 → 状态行 | mihomo 版本 / 代理模式 / TUN 状态（10 秒缓存，支持本机命名管道与 HTTP 外部控制） |
 | Clash 联动 → 代理模式 | 规则 / 全局 / 直连，点击即切换（带勾选） |
-| Clash 联动 → 选择节点 | 按策略组展开，勾选当前节点，点击即切换 |
+| Clash 联动 → 选择节点 | 按策略组展开，勾选当前节点并显示最新测速延迟（ms），点击即切换 |
 | Clash 联动 → TUN 模式 | 勾选开关；开启前会确认（会接管系统全部流量） |
 | Clash 联动 → Clash 就绪时自动启动 ChatGPT | 勾选开关，写回 `config.ini`，默认关 |
 | 重新检测 Clash | 强制刷新 Clash 状态并重新探测代理端口和出网 |
@@ -114,20 +113,18 @@ ChatGptProxyTray.exe --help               帮助
    同时注入环境变量 `HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY`（大小写各一套）+ `NODE_USE_ENV_PROXY=1`，让子进程（如 `codex.exe`、`codex-command-runner.exe`）也继承代理。
    `NO_PROXY=127.0.0.1,localhost,::1` 必须保留 —— 否则本地网关（如 `127.0.0.1:3425`）也会被塞进代理，导致登录/推理接口失败。
 3. **状态检测**：
-   - WMI 查 `ChatGPT.exe / codex.exe / codex-command-runner.exe` 的 `CommandLine`，从根进程命令行提取 `--proxy-server=` 与当前 Clash 端口比对；
-   - `GetExtendedTcpTable` 读内核 TCP 连接表：远端是 `127.0.0.1:<代理端口>` 计入「经代理连接」，其他回环端口是本地服务，非回环远端即「疑似直连」；
-   - `codex.exe` 是否也有到代理端口的连接，用来确认核心进程继承了环境变量。
-4. **关闭**：枚举属于 ChatGPT 相关进程的所有可见顶层窗口逐个 `PostMessage(WM_CLOSE)`（Electron 有多个窗口，只关主窗口不够）；一旦「根进程退出」或「可见窗口全部消失」，再等 2 秒收尾就强制清理残留子进程——实测关闭耗时从约 11 秒降到约 3 秒。
-5. **Clash 联动**：Clash Verge 的 mihomo 内核通过命名管道 `\\.\pipe\verge-mihomo-production-*` 暴露 REST API（不是 HTTP 端口）。程序运行时枚举 `\\.\pipe\` 自动发现管道（Clash 重启后名字会变），读取 `/configs`、`/proxies`，并可：
-   - 切换代理模式（`PATCH /configs`）；
-   - 切换策略组节点（`PUT /proxies/{组名}`）；
-   - 开关 TUN（`PATCH /configs {"tun":{"enable":...}}`，会接管系统全部流量，开启前弹确认）；
-   - Clash 就绪时自动拉起 ChatGPT（需在菜单里打开）。
-   响应是 chunked 编码，先拆块再解析；开关 TUN 时 mihomo 会重建监听器导致响应丢失，所以状态一律以「改动后重新读取的实际值」为准。
-6. **守护模式**：托盘每次刷新状态时，如果发现 ChatGPT 在运行但命令行里没有当前代理参数（直连，或代理端口不一致），就弹气泡提示；点击气泡或菜单「立即接管为代理」会关闭并以代理方式重启。也可以在菜单/配置里打开「自动接管」（默认关，带 30 秒冷却，避免反复重启）。
+   - 先用轻量进程枚举匹配当前用户会话中的 ChatGPT / codex 相关进程（`ChatGPT.exe`、`chatgpt-desktop.exe`、`codex.exe`、`codex-command-runner.exe`、`codex-core-command-runner.exe`、`codex-chrome-native-host.exe` 等；自动排除 Session 0 常驻的 Windows 系统沙箱服务 `codex-windows-sandbox-service.exe`），仅对新出现的 PID 按需查 WMI `CommandLine` 并缓存，从根进程命令行提取 `--proxy-server=` 与当前代理地址比对；
+   - `GetExtendedTcpTable` 读内核 TCP 连接表：远端等于代理主机与端口的计入「经代理连接」，其他回环端口是本地服务，非回环远端即「疑似直连」；
+   - `codex` / `codex-*` 子进程是否也有到代理端口的连接，用来确认核心进程继承了环境变量。
+4. **关闭**：枚举属于相关进程的所有可见顶层窗口逐个 `PostMessage(WM_CLOSE)`（无可见窗口时对主窗补发关闭信号）；一旦「根进程退出」或「可见窗口全部消失」，每 200ms 轮询等待最多 2 秒收尾，提前退完即结束，超时再强制清理残留子进程。
+5. **Clash 联动**：支持两种接入方式：
+   - **本机命名管道（默认）**：自动发现 Clash Verge 的 `\\.\pipe\verge-mihomo-production-*` 管道；
+   - **HTTP 外部控制（可选）**：在 `config.ini` `[clash]` 填入 `api_url` 与 `api_secret` 后，支持任意 Clash/mihomo 客户端及局域网软路由。
+   通过 `/configs`、`/proxies`、`/connections` 读取模式、TUN、策略组（含节点测速延迟）与活跃连接命中，并支持热切换模式/节点/TUN。
+6. **守护模式**：托盘每次刷新状态时，若代理已就绪且发现 ChatGPT 未走代理（直连或代理端口不一致），弹气泡提示；点击气泡或菜单「重启为代理」即可关闭并重启。也可打开「自动接管」（默认关，带 30 秒冷却）。
 7. **开机自启**：写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `ChatGptProxyTray` 值（当前 exe 路径），不需要管理员；托盘启动时如果发现记录的是旧路径（比如移动了目录），会自动更新。
-8. **诊断报告**：`--diag` 或菜单「生成诊断报告」把配置、代理探测、进程树、TCP 连接、Clash 状态、日志尾部写成一个文本文件到程序目录的 `diag\`。
-9. **状态面板**：双击托盘图标（或菜单「打开状态面板」、`--panel`）打开 820×542 的小窗，实时显示代理、ChatGPT、连接统计、Clash 模式/节点和守护开关；并通过 mihomo 的 `/connections` 列出 ChatGPT / codex 每条活跃连接命中的规则、代理链和上下行字节。面板里也能直接刷新、启动/重启/关闭 ChatGPT、生成诊断、打开日志。
+8. **诊断报告**：`--diag` 或菜单「生成诊断报告」把配置、代理探测、进程树、TCP 连接、Clash 状态、日志尾部写成一个文本文件到程序目录的 `diag\`（`api_secret` 会自动脱敏）。
+9. **状态面板**：双击托盘图标（或菜单「打开状态面板」、`--panel`，或再次运行 exe 唤醒已有实例）打开可缩放的高 DPI 面板，实时显示代理、ChatGPT、连接统计、Clash 模式/节点（含延迟）和守护开关；通过 `/connections` 列出 ChatGPT / codex 每条活跃连接命中的规则、代理链和上下行字节，列表双缓冲防闪烁、刷新时保留选中行与滚动位置，并支持右键复制目标/规则/代理链。
 10. **连接与命中查看**：`--connections` 在命令行输出同样两份数据——进程自己到 `127.0.0.1:7897` 的 ESTABLISHED 连接（区分「经代理 / 本地 / 直连!」），以及 Clash 侧每条连接的「规则 + 代理链」，用来确认流量到底走了哪个节点。
 11. **配置热重载**：托盘每次刷新时检查 `config.ini` 的修改时间，变了就重新加载（代理端口、守护、Clash、UI 段全部生效），菜单里也有「重新加载配置」手动触发；改配置不需要重启托盘。
 
@@ -139,25 +136,44 @@ ChatGptProxyTray.exe --help               帮助
 [proxy]
 host=127.0.0.1
 port=7897
-fallback_ports=7897,7890,7891,10808,10809,1080   ; 配置端口不通时依次尝试
-bypass_list=localhost;127.0.0.1;[::1];<local>    ; Chromium --proxy-bypass-list
-no_proxy=127.0.0.1,localhost,::1                  ; 子进程 NO_PROXY
-verify_connect=true                               ; 启动前用 CONNECT 验证出网
+# 配置端口不通时依次尝试
+fallback_ports=7897,7890,7891,10808,10809,1080
+# Chromium --proxy-bypass-list（分号分隔）
+bypass_list=localhost;127.0.0.1;[::1];<local>
+# 子进程 NO_PROXY（逗号分隔）
+no_proxy=127.0.0.1,localhost,::1
+# 启动前用 CONNECT 验证出网
+verify_connect=true
+# CONNECT 验证目标主机和端口
+verify_host=chatgpt.com:443
 
 [target]
 package_name=OpenAI.Codex
-alias_name=chatgpt-desktop.exe                    ; MSIX 执行别名
-exe_path=                                         ; 可选：手动指定真实 ChatGPT.exe
-extra_args=                                       ; 追加 Chromium 参数
+# MSIX 执行别名
+alias_name=chatgpt-desktop.exe
+# 可选：手动指定真实 ChatGPT.exe
+exe_path=
+# 追加 Chromium 参数
+extra_args=
 
 [clash]
-enabled=true                                   ; false = 隐藏 Clash 联动、跳过探测
-auto_launch=false                              ; Clash 就绪时自动启动 ChatGPT
-pipe_name=                                     ; 可选：手动指定 mihomo 命名管道名（留空自动发现）
+# false = 隐藏 Clash 联动、跳过探测
+enabled=true
+# Clash 就绪时自动启动 ChatGPT
+auto_launch=false
+# 可选：手动指定 mihomo 命名管道名（留空自动发现）
+pipe_name=
+# 可选：Clash HTTP 外部控制地址（如 http://127.0.0.1:9097 或 http://192.168.1.10:9097）
+# 填写后优先走 HTTP API（支持局域网与所有 Clash 客户端），留空则走本机命名管道
+api_url=
+# 可选：Clash HTTP 外部控制密钥（secret）
+api_secret=
 
 [guard]
-enabled=true                                   ; 守护模式：发现 ChatGPT 直连时弹提示
-auto_takeover=false                            ; 发现直连时自动重启为代理（会中断会话，默认关）
+# 守护模式：发现 ChatGPT 直连时弹提示
+enabled=true
+# 发现直连时自动重启为代理（会中断会话，默认关）
+auto_takeover=false
 
 [ui]
 refresh_seconds=3
@@ -169,19 +185,22 @@ verify_seconds=8
 代理跑在局域网另一台电脑 / 软路由上时：
 
 1. 在跑 Clash 的那台机器上打开「允许局域网连接」（mihomo：`allow-lan: true`、`bind-address: "*"`），防火墙放行混合端口 TCP（默认 7897）；路由器若开了「客户端隔离 / AP 隔离」要关掉。
-2. 在 ChatGPT 这台机器上把 `config.ini` 的 `[proxy] host` 改成代理机 IP，例如：
+2. 在 ChatGPT 这台机器上把 `config.ini` 的 `[proxy] host` 改成代理机 IP；若想同时使用 Clash 联动（切换模式/节点、查看连接命中），在 `[clash]` 填入远端的 `api_url`（需远端开启 `external-controller`）和 `api_secret`：
 
    ```ini
    [proxy]
    host=192.168.1.10
    port=7897
+
+   [clash]
+   api_url=http://192.168.1.10:9097
+   api_secret=你的secret
    ```
 
    其余不用改（`no_proxy` 仍保留 127.0.0.1，本机网关如 magpie 的 127.0.0.1:3425 不会被代理）。
 3. 先跑 `--selftest`，确认输出里是 `代理: http://192.168.1.10:7897 open=True tunnel=True`，再 `--launch`。
 
-- 状态检测已适配：连接远端等于「代理主机:端口」的会计入「经代理」，不会误报成直连泄漏。
-- **Clash 联动（模式 / 节点 / TUN）跨机器用不了**：mihomo 的 REST API 走的是本机命名管道，远端读不到；需要在远端开 HTTP `external-controller` 才能扩展（本工具暂未支持）。
+- 状态检测、连接列表与诊断报告均已适配：连接远端等于「代理主机:端口」的会计入「经代理」，不会误报成直连泄漏。
 - 代理若开了认证（`authentication`），本工具暂不支持用户名密码，建议内网不开认证，或改用防火墙限制来源 IP。
 
 ## 已验证（本项目实测）
@@ -220,12 +239,11 @@ verify_seconds=8
 - **不是 fail-closed 强制。** 没有防火墙/TUN 兜底，代理进程若绕过环境变量仍可能直连（本工具会把它显示为「疑似直连」但不会阻断）。需要绝对强制时，应在 Clash 侧开 TUN + 进程规则，或加防火墙规则。
 - MSIX 应用升级后包路径变化不影响本工具（始终走执行别名）；若别名名称变了，改 `config.ini` 的 `alias_name`。
 - 仅支持 HTTP 代理（Clash 混合端口 / HTTP 端口）；SOCKS 未接入。
-- **Clash 联动依赖 mihomo 的 REST 命名管道**（Clash Verge 默认开启）。其他客户端如果只暴露 HTTP 外部控制器端口，目前连不上，可在 `config.ini` 的 `pipe_name` 手动指定管道名。
-- **Clash 联动只支持本机 mihomo 命名管道**：代理在局域网其它机器时，联动菜单显示「API 不可用」，注入与状态检测仍正常。
+- **Clash 联动默认走本机 mihomo 命名管道**（Clash Verge 默认开启）；使用其他 Clash 客户端或局域网代理时，可在 `config.ini` 的 `[clash]` 填入 `api_url` 和 `api_secret` 改走 HTTP 外部控制。
 - **TUN 开关是全局性的**：开启期间整个系统的流量都由 Clash 接管，关掉本工具不会自动还原，需要手动关回去。
 - **Clash 的模式 / 节点 / TUN 切换只对当前 Clash 会话生效**（运行时热切换），重启 Clash 后会按其配置文件恢复默认值；要永久生效请直接改 Clash 配置。
 - **守护模式的「自动接管」会中断 ChatGPT 当前会话**（未发出的输入可能丢失），默认只提示不自动重启。
-- 单实例：托盘只允许运行一个；再次启动会静默退出，只写 `logs\app.log`。
+- 单实例：托盘只允许运行一个；再次启动或执行 `--panel` 会直接唤醒已有托盘的状态面板。
 
 ## 故障排查
 
@@ -246,16 +264,17 @@ Codex_Proxy/
 ├─ .github/ISSUE_TEMPLATE/      # issue 模板（bug / feature）
 ├─ tools/CaptureMain.cs         # 开发用：重新生成 README 截图
 ├─ src/
+│  ├─ app.manifest              # High-DPI（PerMonitorV2）与 Windows 10/11 兼容清单
 │  ├─ Native.cs                 # P/Invoke（AttachConsole/GetExtendedTcpTable/DestroyIcon…）
 │  ├─ AutoStart.cs              # 开机自启（HKCU Run）
 │  ├─ Core.cs                   # 日志、配置解析、代理参数/环境变量
 │  ├─ Probe.cs                  # Clash 端口探测、CONNECT 验证、TCP 连接表
-│  ├─ Clash.cs                  # mihomo REST（命名管道）：模式/节点/TUN/JSON 解析
+│  ├─ Clash.cs                  # mihomo REST（命名管道 + HTTP 外部控制）：模式/节点/延迟/TUN/JSON 解析
 │  ├─ Diag.cs                   # 诊断报告生成
-│  ├─ AppProcess.cs             # WMI 进程查询、状态判定、关闭、定位与启动 ChatGPT
-│  ├─ Status.cs                 # 状态聚合（代理/App/连接/泄漏）
-│  ├─ Panel.cs                  # 状态面板（状态/连接/规则命中列表）
-│  ├─ TrayContext.cs            # 托盘 UI（NotifyIcon + 菜单 + 图标绘制 + 定时刷新）
+│  ├─ AppProcess.cs             # 轻量进程枚举 + WMI 缓存、状态判定、关闭、定位与启动 ChatGPT
+│  ├─ Status.cs                 # 状态聚合（代理/App/连接/泄漏/源端口反查）
+│  ├─ Panel.cs                  # 状态面板（可缩放/双缓冲/连接与规则命中列表/右键复制）
+│  ├─ TrayContext.cs            # 托盘 UI（NotifyIcon + 异步刷新 + 菜单 + 单实例唤醒）
 │  └─ Program.cs                # 入口 + 命令行模式
 ├─ dist/                        # 编译输出
 └─ logs/                        # 运行时日志

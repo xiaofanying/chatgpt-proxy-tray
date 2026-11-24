@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Net;
 using System.Text;
 using System.Threading;
 
@@ -157,13 +158,20 @@ namespace ChatGptProxyTray
             private object ParseNumber()
             {
                 int start = _index;
+                bool isFloat = false;
                 while (_index < _text.Length)
                 {
                     char c = _text[_index];
-                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') _index++;
+                    if ((c >= '0' && c <= '9') || c == '-' || c == '+') _index++;
+                    else if (c == '.' || c == 'e' || c == 'E') { isFloat = true; _index++; }
                     else break;
                 }
                 string text = _text.Substring(start, _index - start);
+                if (!isFloat)
+                {
+                    long intVal;
+                    if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal)) return intVal;
+                }
                 double value;
                 if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
                     throw new FormatException("非法 JSON 数字: " + text);
@@ -202,13 +210,31 @@ namespace ChatGptProxyTray
     {
         public bool ApiAvailable;
         public string PipeName = "";
+        public string ApiUrl = "";
         public string Version = "";
         public string Mode = "";
         public bool TunEnabled;
         public string GlobalNow = "";
         public string Error = "";
         public List<ClashGroup> Groups = new List<ClashGroup>();
+        public Dictionary<string, int> NodeDelays = new Dictionary<string, int>(StringComparer.Ordinal);
         public DateTime UpdatedAt = DateTime.Now;
+
+        public string EndpointDisplay
+        {
+            get { return !string.IsNullOrEmpty(ApiUrl) ? ApiUrl : PipeName; }
+        }
+
+        public string FormatNodeWithDelay(string node)
+        {
+            if (string.IsNullOrEmpty(node)) return "";
+            int delay;
+            if (NodeDelays.TryGetValue(node, out delay) && delay > 0)
+            {
+                return node + "  (" + delay.ToString(CultureInfo.InvariantCulture) + " ms)";
+            }
+            return node;
+        }
 
         public string PrimaryGroupName
         {
@@ -228,8 +254,11 @@ namespace ChatGptProxyTray
 
     internal sealed class ClashConnection
     {
+        public string Id = "";
         public string Process = "";
         public string Network = "";
+        public string SourceIp = "";
+        public int SourcePort;
         public string Host = "";
         public string Destination = "";
         public string Rule = "";
@@ -258,7 +287,14 @@ namespace ChatGptProxyTray
         {
             get
             {
-                if (string.IsNullOrEmpty(Rule)) return "";
+                if (string.IsNullOrEmpty(Rule))
+                {
+                    for (int i = 0; i < Chains.Count; i++)
+                    {
+                        if (string.Equals(Chains[i], "GLOBAL", StringComparison.OrdinalIgnoreCase)) return "GLOBAL";
+                    }
+                    return "-";
+                }
                 return string.IsNullOrEmpty(RulePayload) ? Rule : Rule + "/" + RulePayload;
             }
         }
@@ -298,19 +334,17 @@ namespace ChatGptProxyTray
         public static ClashState GetState(AppConfig cfg)
         {
             ClashState state = new ClashState();
-            string pipeName = FindPipe(cfg.ClashPipeName);
-            if (pipeName == null)
-            {
-                state.Error = "未找到 mihomo 命名管道（Clash 未运行或未开启外部控制）";
-                return state;
-            }
-            state.PipeName = pipeName;
-
+            string endpoint;
             string error;
-            ClashHttpResponse versionResponse = Send(pipeName, "GET", "/version", null, out error);
+            ClashHttpResponse versionResponse = SendRequest(cfg, "GET", "/version", null, out endpoint, out error);
+            if (!string.IsNullOrEmpty(cfg.ClashApiUrl)) state.ApiUrl = endpoint;
+            else state.PipeName = endpoint;
+
             if (versionResponse == null)
             {
-                state.Error = "连接 Clash API 失败: " + error;
+                state.Error = string.IsNullOrEmpty(endpoint)
+                    ? error
+                    : "连接 Clash API 失败: " + error;
                 return state;
             }
             if (versionResponse.Status != 200)
@@ -329,7 +363,7 @@ namespace ChatGptProxyTray
                 return state;
             }
 
-            ClashHttpResponse configsResponse = Send(pipeName, "GET", "/configs", null, out error);
+            ClashHttpResponse configsResponse = SendWithEndpoint(cfg, endpoint, "GET", "/configs", null, out error);
             if (configsResponse != null && configsResponse.Status == 200)
             {
                 try
@@ -344,7 +378,7 @@ namespace ChatGptProxyTray
                 }
             }
 
-            ClashHttpResponse proxiesResponse = Send(pipeName, "GET", "/proxies", null, out error);
+            ClashHttpResponse proxiesResponse = SendWithEndpoint(cfg, endpoint, "GET", "/proxies", null, out error);
             if (proxiesResponse != null && proxiesResponse.Status == 200)
             {
                 try
@@ -355,9 +389,17 @@ namespace ChatGptProxyTray
                     {
                         foreach (KeyValuePair<string, object> pair in proxies)
                         {
-                            if (string.Equals(pair.Key, "GLOBAL", StringComparison.Ordinal)) continue;
                             Dictionary<string, object> proxy = Json.AsObject(pair.Value);
                             if (proxy == null) continue;
+
+                            int delay = ExtractLatestDelay(proxy);
+                            if (delay > 0) state.NodeDelays[pair.Key] = delay;
+
+                            if (string.Equals(pair.Key, "GLOBAL", StringComparison.Ordinal))
+                            {
+                                state.GlobalNow = Json.GetString(proxy, "now");
+                                continue;
+                            }
                             if (!string.Equals(Json.GetString(proxy, "type"), "Selector", StringComparison.OrdinalIgnoreCase)) continue;
 
                             ClashGroup group = new ClashGroup();
@@ -384,22 +426,21 @@ namespace ChatGptProxyTray
             state.Groups.Sort(CompareGroups);
             state.ApiAvailable = true;
             state.UpdatedAt = DateTime.Now;
-
-            ClashHttpResponse globalResponse = Send(pipeName, "GET", "/proxies/GLOBAL", null, out error);
-            if (globalResponse != null && globalResponse.Status == 200)
-            {
-                try
-                {
-                    Dictionary<string, object> globalObject = Json.AsObject(Json.Parse(globalResponse.Body));
-                    state.GlobalNow = Json.GetString(globalObject, "now");
-                }
-                catch (Exception ex)
-                {
-                    Log.Warn("解析 /proxies/GLOBAL 失败: " + ex.Message);
-                }
-            }
-
             return state;
+        }
+
+        private static int ExtractLatestDelay(Dictionary<string, object> proxy)
+        {
+            List<object> history = Json.AsArray(Json.Get(proxy, "history"));
+            if (history == null || history.Count == 0) return 0;
+            for (int i = history.Count - 1; i >= 0; i--)
+            {
+                Dictionary<string, object> item = Json.AsObject(history[i]);
+                if (item == null) continue;
+                long delay = GetLong(item, "delay");
+                if (delay > 0 && delay < int.MaxValue) return (int)delay;
+            }
+            return 0;
         }
 
         private static int CompareGroups(ClashGroup left, ClashGroup right)
@@ -430,7 +471,7 @@ namespace ChatGptProxyTray
         {
             error = "";
             string patchError;
-            bool sent = PatchConfig(cfg, "{\"mode\":\"" + mode + "\"}", out patchError);
+            bool sent = PatchConfig(cfg, "{\"mode\":\"" + EscapeJson(mode) + "\"}", out patchError);
             ClashState state = GetState(cfg);
             if (state.ApiAvailable && string.Equals(state.Mode, mode, StringComparison.OrdinalIgnoreCase)) return true;
             if (sent) return true;
@@ -454,13 +495,8 @@ namespace ChatGptProxyTray
 
         public static bool PatchConfig(AppConfig cfg, string body, out string error)
         {
-            string pipeName = FindPipe(cfg.ClashPipeName);
-            if (pipeName == null)
-            {
-                error = "未找到 mihomo 命名管道";
-                return false;
-            }
-            ClashHttpResponse response = Send(pipeName, "PATCH", "/configs", body, out error);
+            string endpoint;
+            ClashHttpResponse response = SendRequest(cfg, "PATCH", "/configs", body, out endpoint, out error);
             if (response == null) return false;
             if (response.Status >= 200 && response.Status < 300) return true;
             error = "HTTP " + response.Status + (response.Body.Length > 0 ? ": " + Trim(response.Body, 200) : "");
@@ -470,14 +506,9 @@ namespace ChatGptProxyTray
         public static bool SelectNode(AppConfig cfg, string group, string node, out string error)
         {
             error = "";
-            string pipeName = FindPipe(cfg.ClashPipeName);
-            if (pipeName == null)
-            {
-                error = "未找到 mihomo 命名管道";
-                return false;
-            }
             string body = "{\"name\":\"" + EscapeJson(node) + "\"}";
-            ClashHttpResponse response = Send(pipeName, "PUT", "/proxies/" + Uri.EscapeDataString(group), body, out error);
+            string endpoint;
+            ClashHttpResponse response = SendRequest(cfg, "PUT", "/proxies/" + Uri.EscapeDataString(group), body, out endpoint, out error);
             if (response != null && response.Status >= 200 && response.Status < 300) return true;
 
             string httpError = response == null ? error : "HTTP " + response.Status + (response.Body.Length > 0 ? ": " + Trim(response.Body, 200) : "");
@@ -500,14 +531,8 @@ namespace ChatGptProxyTray
         {
             error = "";
             List<ClashConnection> list = new List<ClashConnection>();
-            string pipeName = FindPipe(cfg.ClashPipeName);
-            if (pipeName == null)
-            {
-                error = "未找到 mihomo 命名管道（Clash 未运行）";
-                return list;
-            }
-
-            ClashHttpResponse response = Send(pipeName, "GET", "/connections", null, out error);
+            string endpoint;
+            ClashHttpResponse response = SendRequest(cfg, "GET", "/connections", null, out endpoint, out error);
             if (response == null) return list;
             if (response.Status != 200)
             {
@@ -527,11 +552,14 @@ namespace ChatGptProxyTray
                     if (item == null) continue;
 
                     ClashConnection connection = new ClashConnection();
+                    connection.Id = Json.GetString(item, "id");
                     Dictionary<string, object> metadata = Json.AsObject(Json.Get(item, "metadata"));
                     if (metadata != null)
                     {
                         connection.Process = Json.GetString(metadata, "process");
                         connection.Network = Json.GetString(metadata, "network");
+                        connection.SourceIp = Json.GetString(metadata, "sourceIP");
+                        connection.SourcePort = (int)GetLong(metadata, "sourcePort");
                         connection.Host = Json.GetString(metadata, "host");
                         string destinationIp = Json.GetString(metadata, "destinationIP");
                         string destinationPort = Json.GetString(metadata, "destinationPort");
@@ -569,6 +597,9 @@ namespace ChatGptProxyTray
         {
             object value = Json.Get(obj, key);
             if (value == null) return 0;
+            if (value is long) return (long)value;
+            if (value is int) return (int)value;
+            if (value is double) return (long)(double)value;
             long parsed;
             string text = Convert.ToString(value, CultureInfo.InvariantCulture);
             return long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) ? parsed : 0;
@@ -576,6 +607,7 @@ namespace ChatGptProxyTray
 
         private static string EscapeJson(string text)
         {
+            if (string.IsNullOrEmpty(text)) return "";
             StringBuilder builder = new StringBuilder();
             for (int i = 0; i < text.Length; i++)
             {
@@ -584,10 +616,21 @@ namespace ChatGptProxyTray
                 {
                     case '"': builder.Append("\\\""); break;
                     case '\\': builder.Append("\\\\"); break;
+                    case '\b': builder.Append("\\b"); break;
+                    case '\f': builder.Append("\\f"); break;
                     case '\n': builder.Append("\\n"); break;
                     case '\r': builder.Append("\\r"); break;
                     case '\t': builder.Append("\\t"); break;
-                    default: builder.Append(c); break;
+                    default:
+                        if (c < 0x20)
+                        {
+                            builder.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                        }
+                        else
+                        {
+                            builder.Append(c);
+                        }
+                        break;
                 }
             }
             return builder.ToString();
@@ -597,6 +640,116 @@ namespace ChatGptProxyTray
         {
             string clean = text.Replace("\r", " ").Replace("\n", " ").Trim();
             return clean.Length <= max ? clean : clean.Substring(0, max) + "…";
+        }
+
+        private static ClashHttpResponse SendRequest(AppConfig cfg, string method, string path, string jsonBody, out string endpoint, out string error)
+        {
+            if (!string.IsNullOrEmpty(cfg.ClashApiUrl))
+            {
+                endpoint = NormalizeApiUrl(cfg.ClashApiUrl);
+                return SendHttp(endpoint, cfg.ClashApiSecret, method, path, jsonBody, out error);
+            }
+            string pipeName = FindPipe(cfg.ClashPipeName);
+            if (pipeName == null)
+            {
+                endpoint = "";
+                error = "未找到 mihomo 命名管道（Clash 未运行或未开启外部控制）";
+                return null;
+            }
+            endpoint = pipeName;
+            return Send(pipeName, method, path, jsonBody, out error);
+        }
+
+        private static ClashHttpResponse SendWithEndpoint(AppConfig cfg, string endpoint, string method, string path, string jsonBody, out string error)
+        {
+            if (!string.IsNullOrEmpty(cfg.ClashApiUrl))
+            {
+                return SendHttp(endpoint, cfg.ClashApiSecret, method, path, jsonBody, out error);
+            }
+            return Send(endpoint, method, path, jsonBody, out error);
+        }
+
+        private static string NormalizeApiUrl(string url)
+        {
+            string trimmed = url.Trim().TrimEnd('/');
+            if (!trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                trimmed = "http://" + trimmed;
+            }
+            return trimmed;
+        }
+
+        private static ClashHttpResponse SendHttp(string baseUrl, string secret, string method, string path, string jsonBody, out string error)
+        {
+            error = "";
+            try
+            {
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(baseUrl + path);
+                request.Method = method;
+                request.Proxy = null;
+                request.Timeout = 3000;
+                request.ReadWriteTimeout = 5000;
+                request.Accept = "*/*";
+                if (!string.IsNullOrEmpty(secret))
+                {
+                    request.Headers["Authorization"] = "Bearer " + secret;
+                }
+                if (jsonBody != null)
+                {
+                    byte[] bodyBytes = Encoding.UTF8.GetBytes(jsonBody);
+                    request.ContentType = "application/json";
+                    request.ContentLength = bodyBytes.Length;
+                    using (Stream reqStream = request.GetRequestStream())
+                    {
+                        reqStream.Write(bodyBytes, 0, bodyBytes.Length);
+                    }
+                }
+                using (HttpWebResponse resp = (HttpWebResponse)request.GetResponse())
+                {
+                    return ReadHttpWebResponse(resp);
+                }
+            }
+            catch (WebException wex)
+            {
+                if (wex.Response != null)
+                {
+                    try
+                    {
+                        using (HttpWebResponse errResp = (HttpWebResponse)wex.Response)
+                        {
+                            return ReadHttpWebResponse(errResp);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+                error = wex.Message;
+                return null;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return null;
+            }
+        }
+
+        private static ClashHttpResponse ReadHttpWebResponse(HttpWebResponse resp)
+        {
+            ClashHttpResponse result = new ClashHttpResponse();
+            result.Status = (int)resp.StatusCode;
+            using (Stream stream = resp.GetResponseStream())
+            {
+                if (stream != null)
+                {
+                    using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        result.Body = reader.ReadToEnd();
+                    }
+                }
+            }
+            return result;
         }
 
         public static ClashHttpResponse Send(string pipeName, string method, string path, string jsonBody, out string error)
@@ -623,8 +776,9 @@ namespace ChatGptProxyTray
                     if (bodyBytes.Length > 0) pipe.Write(bodyBytes, 0, bodyBytes.Length);
                     pipe.Flush();
 
-                    byte[] raw = ReadResponse(pipe, 500, 5000);
-                    return ParseResponse(raw, out error);
+                    int length;
+                    byte[] raw = ReadResponse(pipe, 500, 5000, out length);
+                    return ParseResponse(raw, length, out error);
                 }
             }
             catch (Exception ex)
@@ -634,26 +788,38 @@ namespace ChatGptProxyTray
             }
         }
 
-        private static byte[] ReadResponse(NamedPipeClientStream pipe, int idleTimeoutMs, int totalTimeoutMs)
+        private static byte[] ReadResponse(NamedPipeClientStream pipe, int idleTimeoutMs, int totalTimeoutMs, out int totalLength)
         {
-            MemoryStream buffer = new MemoryStream();
-            byte[] chunk = new byte[8192];
-            DateTime deadline = DateTime.UtcNow.AddMilliseconds(totalTimeoutMs);
-            while (DateTime.UtcNow < deadline)
+            using (MemoryStream buffer = new MemoryStream())
             {
-                IAsyncResult asyncResult = pipe.BeginRead(chunk, 0, chunk.Length, null, null);
-                if (!asyncResult.AsyncWaitHandle.WaitOne(idleTimeoutMs, false)) break;
-                int read = pipe.EndRead(asyncResult);
-                if (read <= 0) break;
-                buffer.Write(chunk, 0, read);
-                if (IsComplete(buffer.ToArray())) break;
+                byte[] chunk = new byte[8192];
+                DateTime deadline = DateTime.UtcNow.AddMilliseconds(totalTimeoutMs);
+                while (DateTime.UtcNow < deadline)
+                {
+                    IAsyncResult asyncResult = pipe.BeginRead(chunk, 0, chunk.Length, null, null);
+                    WaitHandle waitHandle = asyncResult.AsyncWaitHandle;
+                    int read;
+                    try
+                    {
+                        if (!waitHandle.WaitOne(idleTimeoutMs, false)) break;
+                        read = pipe.EndRead(asyncResult);
+                    }
+                    finally
+                    {
+                        try { waitHandle.Close(); } catch { }
+                    }
+                    if (read <= 0) break;
+                    buffer.Write(chunk, 0, read);
+                    if (IsComplete(buffer.GetBuffer(), (int)buffer.Length)) break;
+                }
+                totalLength = (int)buffer.Length;
+                return buffer.GetBuffer();
             }
-            return buffer.ToArray();
         }
 
-        private static bool IsComplete(byte[] data)
+        private static bool IsComplete(byte[] data, int length)
         {
-            int headerEnd = IndexOf(data, 0, new byte[] { 13, 10, 13, 10 });
+            int headerEnd = IndexOf(data, 0, length, new byte[] { 13, 10, 13, 10 });
             if (headerEnd < 0) return false;
 
             string headers = Encoding.ASCII.GetString(data, 0, headerEnd);
@@ -662,87 +828,91 @@ namespace ChatGptProxyTray
 
             int bodyOffset = headerEnd + 4;
             int contentLength = ParseHeaderInt(headers, "Content-Length");
-            if (contentLength >= 0) return data.Length - bodyOffset >= contentLength;
+            if (contentLength >= 0) return length - bodyOffset >= contentLength;
 
             if (headers.IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 bool complete;
-                Dechunk(data, bodyOffset, out complete, false);
+                Dechunk(data, bodyOffset, length, out complete, false);
                 return complete;
             }
             return false;
         }
 
-        private static ClashHttpResponse ParseResponse(byte[] data, out string error)
+        private static ClashHttpResponse ParseResponse(byte[] data, int length, out string error)
         {
             error = "";
-            if (data == null || data.Length == 0)
+            if (data == null || length <= 0)
             {
                 error = "代理 API 无响应";
                 return null;
             }
 
-            int headerEnd = IndexOf(data, 0, new byte[] { 13, 10, 13, 10 });
-            if (headerEnd < 0) headerEnd = data.Length;
+            int headerEnd = IndexOf(data, 0, length, new byte[] { 13, 10, 13, 10 });
+            if (headerEnd < 0) headerEnd = length;
 
             string headers = Encoding.ASCII.GetString(data, 0, headerEnd);
             ClashHttpResponse response = new ClashHttpResponse();
             response.Status = ParseStatus(headers);
 
             int bodyOffset = headerEnd + 4;
-            if (bodyOffset > data.Length) bodyOffset = data.Length;
+            if (bodyOffset > length) bodyOffset = length;
             bool chunked = headers.IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0;
             if (chunked)
             {
                 bool complete;
-                response.Body = Dechunk(data, bodyOffset, out complete, true);
+                response.Body = Dechunk(data, bodyOffset, length, out complete, true);
             }
             else
             {
                 int contentLength = ParseHeaderInt(headers, "Content-Length");
-                int available = data.Length - bodyOffset;
-                int length = contentLength >= 0 && contentLength <= available ? contentLength : available;
-                response.Body = Encoding.UTF8.GetString(data, bodyOffset, length);
+                int available = length - bodyOffset;
+                int bodyLen = contentLength >= 0 && contentLength <= available ? contentLength : available;
+                response.Body = Encoding.UTF8.GetString(data, bodyOffset, bodyLen);
             }
             return response;
         }
 
-        private static string Dechunk(byte[] data, int offset, out bool complete, bool decode)
+        private static string Dechunk(byte[] data, int offset, int length, out bool complete, bool decode)
         {
             complete = false;
-            MemoryStream output = new MemoryStream();
-            int position = offset;
-            while (true)
+            using (MemoryStream output = decode ? new MemoryStream() : null)
             {
-                int lineEnd = IndexOf(data, position, new byte[] { 13, 10 });
-                if (lineEnd < 0) break;
-
-                string sizeLine = Encoding.ASCII.GetString(data, position, lineEnd - position).Trim();
-                int semicolon = sizeLine.IndexOf(';');
-                if (semicolon >= 0) sizeLine = sizeLine.Substring(0, semicolon).Trim();
-
-                int size;
-                if (!int.TryParse(sizeLine, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out size)) break;
-                position = lineEnd + 2;
-                if (size == 0)
+                int position = offset;
+                while (true)
                 {
-                    complete = true;
-                    break;
+                    int lineEnd = IndexOf(data, position, length, new byte[] { 13, 10 });
+                    if (lineEnd < 0) break;
+
+                    string sizeLine = Encoding.ASCII.GetString(data, position, lineEnd - position).Trim();
+                    int semicolon = sizeLine.IndexOf(';');
+                    if (semicolon >= 0) sizeLine = sizeLine.Substring(0, semicolon).Trim();
+
+                    int size;
+                    if (!int.TryParse(sizeLine, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out size)) break;
+                    position = lineEnd + 2;
+                    if (size == 0)
+                    {
+                        complete = true;
+                        break;
+                    }
+                    if (position + size + 2 > length) break;
+                    if (decode) output.Write(data, position, size);
+                    position += size + 2;
                 }
-                if (position + size + 2 > data.Length) break;
-                if (decode) output.Write(data, position, size);
-                position += size + 2;
+                return decode ? Encoding.UTF8.GetString(output.GetBuffer(), 0, (int)output.Length) : "";
             }
-            return decode ? Encoding.UTF8.GetString(output.ToArray()) : "";
         }
 
         private static int ParseStatus(string headers)
         {
             if (string.IsNullOrEmpty(headers)) return 0;
-            int space = headers.IndexOf(' ');
+            int lineEnd = headers.IndexOf('\n');
+            string firstLine = lineEnd >= 0 ? headers.Substring(0, lineEnd).Trim() : headers.Trim();
+            int space = firstLine.IndexOf(' ');
             if (space < 0) return 0;
-            int end = headers.IndexOf(' ', space + 1);
-            string code = end < 0 ? headers.Substring(space + 1).Trim() : headers.Substring(space + 1, end - space - 1);
+            int end = firstLine.IndexOf(' ', space + 1);
+            string code = end < 0 ? firstLine.Substring(space + 1).Trim() : firstLine.Substring(space + 1, end - space - 1);
             int status;
             return int.TryParse(code, NumberStyles.Integer, CultureInfo.InvariantCulture, out status) ? status : 0;
         }
@@ -762,10 +932,11 @@ namespace ChatGptProxyTray
             return -1;
         }
 
-        private static int IndexOf(byte[] data, int start, byte[] pattern)
+        private static int IndexOf(byte[] data, int start, int length, byte[] pattern)
         {
             if (data == null || pattern == null || pattern.Length == 0) return -1;
-            for (int i = start; i <= data.Length - pattern.Length; i++)
+            int limit = Math.Min(length, data.Length) - pattern.Length;
+            for (int i = start; i <= limit; i++)
             {
                 bool match = true;
                 for (int j = 0; j < pattern.Length; j++)

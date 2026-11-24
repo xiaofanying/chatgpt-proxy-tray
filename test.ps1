@@ -1,4 +1,4 @@
-# ChatGPT 代理助手 —— 冒烟测试
+﻿# ChatGPT 代理助手 —— 冒烟测试
 # 用法（在仓库根目录）：
 #   pwsh -NoProfile -ExecutionPolicy Bypass -File test.ps1
 #   pwsh -NoProfile -ExecutionPolicy Bypass -File test.ps1 -SkipLaunch     # 不启动/关闭 ChatGPT
@@ -58,9 +58,18 @@ function Get-IniValue {
 
 Write-Host ''
 Write-Host '== 1/8 编译 ==' -ForegroundColor Cyan
-& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'build.ps1') | Out-Host
+& (Join-Path $root 'build.ps1') | Out-Host
 Assert-True '生成 dist\ChatGptProxyTray.exe' (Test-Path $exe)
 Assert-True 'dist\config.ini 含 [guard] 段' ((Get-Content $distConfig -Encoding UTF8 -Raw) -match '\[guard\]')
+
+$r = Invoke-Cli @('-h')
+Assert-True '-h 帮助 exit=0' ($r.ExitCode -eq 0 -and $r.Text -match '用法:') ('exit=' + $r.ExitCode)
+$r = Invoke-Cli @('/?')
+Assert-True '/? 帮助 exit=0' ($r.ExitCode -eq 0 -and $r.Text -match '用法:') ('exit=' + $r.ExitCode)
+$r = Invoke-Cli @('--clash-tun', 'invalid')
+Assert-True '--clash-tun 非法参数返回 2' ($r.ExitCode -eq 2) ('exit=' + $r.ExitCode)
+$r = Invoke-Cli @('--clash-auto', 'invalid')
+Assert-True '--clash-auto 非法参数返回 2' ($r.ExitCode -eq 2) ('exit=' + $r.ExitCode)
 
 Write-Host ''
 Write-Host '== 2/8 自检 ==' -ForegroundColor Cyan
@@ -106,6 +115,8 @@ Assert-True 'guard.auto_takeover=true 已写入' ((Get-IniValue $distConfig 'gua
 $r = Invoke-Cli @('--guard-auto', 'off')
 Assert-True '--guard-auto off exit=0' ($r.ExitCode -eq 0)
 Assert-True 'guard.auto_takeover=false 已写入' ((Get-IniValue $distConfig 'guard' 'auto_takeover') -eq 'false')
+$guardSectionCount = ([regex]::Matches((Get-Content $distConfig -Encoding UTF8 -Raw), '(?m)^\[guard\]\s*$')).Count
+Assert-True 'config.ini 未出现重复 [guard] 节' ($guardSectionCount -eq 1) ('count=' + $guardSectionCount)
 
 Write-Host ''
 Write-Host '== 5/8 开机自启（HKCU Run） ==' -ForegroundColor Cyan
@@ -146,6 +157,8 @@ Assert-True '日志记录托盘已启动' ($logText -match '托盘已启动')
 $second = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 3
 Assert-True '第二个实例静默退出（无模态框）' ($second.HasExited)
+$wake = Invoke-Cli @('--panel')
+Assert-True '托盘运行时 --panel 唤醒已有面板并返回 0' ($wake.ExitCode -eq 0 -and $wake.Text -match '已唤醒') ('exit=' + $wake.ExitCode + ' text=' + $wake.Text)
 Get-Process ChatGptProxyTray -ErrorAction SilentlyContinue | Stop-Process -Force
 
 Write-Host ''

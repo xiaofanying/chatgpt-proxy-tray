@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
-using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -12,12 +11,15 @@ namespace ChatGptProxyTray
 {
     internal sealed class TrayContext : ApplicationContext
     {
+        public const string WakeupEventName = @"Local\ChatGptProxyTray.ShowPanel";
+
         private static readonly Color ColorGreen = Color.FromArgb(46, 160, 67);
         private static readonly Color ColorYellow = Color.FromArgb(210, 153, 34);
         private static readonly Color ColorRed = Color.FromArgb(218, 54, 51);
         private static readonly Color ColorGray = Color.FromArgb(110, 118, 129);
 
         private AppConfig _cfg;
+        private readonly Control _invoker;
         private readonly NotifyIcon _icon;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _itemProxy;
@@ -37,18 +39,30 @@ namespace ChatGptProxyTray
         private readonly System.Windows.Forms.Timer _verifyTimer;
         private readonly Dictionary<int, Icon> _icons = new Dictionary<int, Icon>();
 
+        private EventWaitHandle _wakeupEvent;
+        private RegisteredWaitHandle _wakeupWaitHandle;
+
         private StatusReport _report;
         private ProxyProbeResult _probe;
         private DateTime _probeAt = DateTime.MinValue;
         private ClashState _clash;
         private DateTime _clashAt = DateTime.MinValue;
         private bool _autoLaunchArmed = true;
-        private bool _busy;
+        private bool _autoStartEnabled;
+        private bool _refreshingStatus;
+        private bool _pendingStatusRefresh;
+        private bool _pendingStatusForceProbe;
+        private readonly List<Action<StatusReport>> _pendingStatusCallbacks = new List<Action<StatusReport>>();
+        private bool _refreshingClash;
+        private bool _pendingClashRefresh;
+        private bool _pendingClashForce;
+        private readonly List<Action> _pendingClashCallbacks = new List<Action>();
+        private bool _actionBusy;
         private bool _directNotified;
         private bool _guardAutoRunning;
         private bool _lastBalloonIsGuard;
+        private bool _disposed;
         private DateTime _lastGuardAutoAt = DateTime.MinValue;
-        private ToolStripMenuItem _itemTakeover;
         private ToolStripMenuItem _itemGuard;
         private ToolStripMenuItem _itemGuardAuto;
         private ToolStripMenuItem _itemAutoStart;
@@ -62,6 +76,11 @@ namespace ChatGptProxyTray
         {
             _cfg = AppConfig.Load();
 
+            // 隐藏控件用于在任意后台线程安全地 BeginInvoke 回 UI 线程
+            _invoker = new Control();
+            IntPtr handle = _invoker.Handle;
+            if (handle == IntPtr.Zero) Log.Warn("创建 UI 调度句柄失败");
+
             _menu = new ContextMenuStrip();
             _itemProxy = AddStatusItem("Clash：检测中…");
             _itemApp = AddStatusItem("ChatGPT：检测中…");
@@ -71,8 +90,6 @@ namespace ChatGptProxyTray
             _itemLaunch = AddActionItem("启动 ChatGPT（走代理）", OnLaunch);
             _itemClose = AddActionItem("关闭 ChatGPT", OnCloseApp);
             _itemPanel = AddActionItem("打开状态面板", OnOpenPanel);
-            _menu.Items.Add(new ToolStripSeparator());
-            _itemTakeover = AddActionItem("立即接管为代理（重启 ChatGPT）", OnTakeover);
             _menu.Items.Add(new ToolStripSeparator());
             _itemGuard = AddActionItem("守护模式（发现直连时提示）", OnToggleGuard);
             _itemGuardAuto = AddActionItem("发现直连时自动接管（重启为代理）", OnToggleGuardAuto);
@@ -103,9 +120,65 @@ namespace ChatGptProxyTray
             _timer.Start();
 
             InitializeOptions();
-            RefreshClashState(true);
-            RefreshStatus(false);
+            RegisterWakeupListener();
+            RefreshClashStateAsync(true, null);
+            RefreshStatusAsync(false, null);
             Log.Info("托盘已启动，配置: " + _cfg.ConfigPath);
+        }
+
+        private void RegisterWakeupListener()
+        {
+            try
+            {
+                bool createdNew;
+                _wakeupEvent = new EventWaitHandle(false, EventResetMode.AutoReset, WakeupEventName, out createdNew);
+                _wakeupWaitHandle = ThreadPool.RegisterWaitForSingleObject(
+                    _wakeupEvent,
+                    delegate(object state, bool timedOut)
+                    {
+                        if (!timedOut)
+                        {
+                            PostUi(delegate { OpenPanel(); });
+                        }
+                    },
+                    null,
+                    -1,
+                    false);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("注册单实例唤醒事件失败: " + ex.Message);
+            }
+        }
+
+        public static bool SignalExistingInstance()
+        {
+            try
+            {
+                using (EventWaitHandle handle = EventWaitHandle.OpenExisting(WakeupEventName))
+                {
+                    return handle.Set();
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void PostUi(Action action)
+        {
+            if (_disposed || action == null) return;
+            try
+            {
+                if (_invoker != null && !_invoker.IsDisposed && _invoker.IsHandleCreated)
+                {
+                    _invoker.BeginInvoke(action);
+                }
+            }
+            catch
+            {
+            }
         }
 
         private ToolStripMenuItem AddStatusItem(string text)
@@ -126,39 +199,76 @@ namespace ChatGptProxyTray
         private void OnTimerTick(object sender, EventArgs e)
         {
             if (_verifyTimer.Enabled) return;
-            CheckConfigReload();
-            RefreshClashState(false);
-            RefreshStatus(false);
-            ConsiderAutoLaunch(_report);
+            if (CheckConfigReload()) return;
+            RefreshClashStateAsync(false, null);
+            RefreshStatusAsync(false, null);
         }
 
-        private void RefreshStatus(bool forceProbe)
+        private void RefreshStatusAsync(bool forceProbe, Action<StatusReport> onCompleted)
         {
-            if (_busy) return;
-            _busy = true;
-            try
+            if (_disposed) return;
+            if (_refreshingStatus)
             {
-                ProxyProbeResult probe = GetProbe(forceProbe);
-                _report = StatusEvaluator.Evaluate(_cfg, probe);
-                ApplyStatus(_report);
+                if (forceProbe || onCompleted != null)
+                {
+                    _pendingStatusRefresh = true;
+                    if (forceProbe) _pendingStatusForceProbe = true;
+                    if (onCompleted != null) _pendingStatusCallbacks.Add(onCompleted);
+                }
+                return;
             }
-            catch (Exception ex)
-            {
-                Log.Error("刷新状态失败", ex);
-            }
-            finally
-            {
-                _busy = false;
-            }
-        }
+            _refreshingStatus = true;
 
-        private ProxyProbeResult GetProbe(bool force)
-        {
-            int ttlSeconds = _probe != null && _probe.PortOpen ? 60 : 10;
-            if (!force && _probe != null && (DateTime.UtcNow - _probeAt).TotalSeconds < ttlSeconds) return _probe;
-            _probe = ClashProbe.Detect(_cfg);
-            _probeAt = DateTime.UtcNow;
-            return _probe;
+            AppConfig cfg = _cfg;
+            ProxyProbeResult cachedProbe = _probe;
+            DateTime cachedProbeAt = _probeAt;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                ProxyProbeResult probe = cachedProbe;
+                DateTime probeAt = cachedProbeAt;
+                StatusReport report = null;
+                try
+                {
+                    int ttlSeconds = probe != null && probe.PortOpen ? 60 : 10;
+                    if (forceProbe || probe == null || (DateTime.UtcNow - probeAt).TotalSeconds >= ttlSeconds)
+                    {
+                        probe = ClashProbe.Detect(cfg);
+                        probeAt = DateTime.UtcNow;
+                    }
+                    report = StatusEvaluator.Evaluate(cfg, probe);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("刷新状态失败", ex);
+                }
+
+                PostUi(delegate
+                {
+                    _refreshingStatus = false;
+                    if (report != null)
+                    {
+                        _probe = probe;
+                        _probeAt = probeAt;
+                        ApplyStatus(report);
+                        ConsiderAutoLaunch(report);
+                    }
+                    if (onCompleted != null) onCompleted(report);
+
+                    if (_pendingStatusRefresh && !_disposed)
+                    {
+                        bool nextForce = _pendingStatusForceProbe;
+                        List<Action<StatusReport>> callbacks = new List<Action<StatusReport>>(_pendingStatusCallbacks);
+                        _pendingStatusRefresh = false;
+                        _pendingStatusForceProbe = false;
+                        _pendingStatusCallbacks.Clear();
+                        RefreshStatusAsync(nextForce, delegate(StatusReport nextReport)
+                        {
+                            for (int i = 0; i < callbacks.Count; i++) callbacks[i](nextReport);
+                        });
+                    }
+                });
+            });
         }
 
         private void ApplyStatus(StatusReport report)
@@ -172,10 +282,15 @@ namespace ChatGptProxyTray
                 color = ColorRed;
                 tooltip = "Clash :" + report.Proxy.Port + " 不可用";
             }
-            else if (report.HasLeak)
+            else if (report.App == AppState.Proxied && report.HasLeak)
             {
                 color = ColorRed;
-                tooltip = "检测到疑似直连 " + report.DirectRemotes.Count + " 条";
+                tooltip = "代理模式下检测到疑似直连 " + report.DirectRemotes.Count + " 条";
+            }
+            else if (!report.Proxy.TunnelOk)
+            {
+                color = ColorYellow;
+                tooltip = "Clash :" + report.Proxy.Port + " 端口通但出网验证失败";
             }
             else
             {
@@ -215,16 +330,16 @@ namespace ChatGptProxyTray
             else if (report.App == AppState.NotRunning)
             {
                 _itemLaunch.Text = "启动 ChatGPT（走代理）";
-                _itemLaunch.Enabled = true;
+                _itemLaunch.Enabled = !_actionBusy;
             }
             else
             {
-                _itemLaunch.Text = "重启为代理";
-                _itemLaunch.Enabled = true;
+                _itemLaunch.Text = "重启为代理（接管当前实例）";
+                _itemLaunch.Enabled = !_actionBusy;
             }
-            _itemClose.Enabled = report.App != AppState.NotRunning;
+            _itemClose.Enabled = !_actionBusy && report.App != AppState.NotRunning;
             UpdateClashMenu();
-            UpdateGuardMenu(report);
+            UpdateGuardMenu();
             ConsiderGuard(report);
         }
 
@@ -246,7 +361,7 @@ namespace ChatGptProxyTray
             _clashMenu.DropDownItems.Add(_clashModeItem);
 
             _clashNodeItem = new ToolStripMenuItem("选择节点");
-            ToolStripMenuItem loading = new ToolStripMenuItem("（打开菜单时加载）");
+            ToolStripMenuItem loading = new ToolStripMenuItem("（正在加载…）");
             loading.Enabled = false;
             _clashNodeItem.DropDownItems.Add(loading);
             _clashMenu.DropDownItems.Add(_clashNodeItem);
@@ -266,24 +381,79 @@ namespace ChatGptProxyTray
         private void OnClashMenuOpening(object sender, EventArgs e)
         {
             if (!_cfg.ClashEnabled) return;
-            RefreshClashState(true);
+            // 立即用当前缓存构建菜单避免阻塞展开，同时后台异步刷新最新状态
+            bool hadGroups = _clash != null && _clash.ApiAvailable && _clash.Groups.Count > 0;
             RebuildNodeMenu();
             UpdateClashMenu();
+            RefreshClashStateAsync(true, delegate
+            {
+                // 若用户已把鼠标移入「选择节点」子菜单且已有节点列表，避免清空导致子菜单被意外折叠
+                if (!_clashNodeItem.DropDown.Visible || !hadGroups)
+                {
+                    RebuildNodeMenu();
+                }
+                UpdateClashMenu();
+            });
         }
 
-        private void RefreshClashState(bool force)
+        private void RefreshClashStateAsync(bool force, Action onCompleted)
         {
-            if (!_cfg.ClashEnabled) return;
-            if (!force && _clash != null && (DateTime.UtcNow - _clashAt).TotalSeconds < 10) return;
-            try
+            if (_disposed || !_cfg.ClashEnabled) return;
+            if (!force && _clash != null && (DateTime.UtcNow - _clashAt).TotalSeconds < 10)
             {
-                _clash = ClashApi.GetState(_cfg);
-                _clashAt = DateTime.UtcNow;
+                if (onCompleted != null) onCompleted();
+                return;
             }
-            catch (Exception ex)
+            if (_refreshingClash)
             {
-                Log.Warn("读取 Clash 状态失败: " + ex.Message);
+                if (force || onCompleted != null)
+                {
+                    _pendingClashRefresh = true;
+                    if (force) _pendingClashForce = true;
+                    if (onCompleted != null) _pendingClashCallbacks.Add(onCompleted);
+                }
+                return;
             }
+            _refreshingClash = true;
+
+            AppConfig cfg = _cfg;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                ClashState state = null;
+                try
+                {
+                    state = ClashApi.GetState(cfg);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("读取 Clash 状态失败: " + ex.Message);
+                }
+
+                PostUi(delegate
+                {
+                    _refreshingClash = false;
+                    if (state != null)
+                    {
+                        _clash = state;
+                        _clashAt = DateTime.UtcNow;
+                        UpdateClashMenu();
+                    }
+                    if (onCompleted != null) onCompleted();
+
+                    if (_pendingClashRefresh && !_disposed)
+                    {
+                        bool nextForce = _pendingClashForce;
+                        List<Action> callbacks = new List<Action>(_pendingClashCallbacks);
+                        _pendingClashRefresh = false;
+                        _pendingClashForce = false;
+                        _pendingClashCallbacks.Clear();
+                        RefreshClashStateAsync(nextForce, delegate
+                        {
+                            for (int i = 0; i < callbacks.Count; i++) callbacks[i]();
+                        });
+                    }
+                });
+            });
         }
 
         private void UpdateClashMenu()
@@ -304,7 +474,7 @@ namespace ChatGptProxyTray
             ClashState state = _clash;
             if (state == null)
             {
-                _clashStatusItem.Text = "Clash：尚未检测";
+                _clashStatusItem.Text = "Clash：检测中…";
             }
             else if (!state.ApiAvailable)
             {
@@ -332,7 +502,7 @@ namespace ChatGptProxyTray
 
             if (available && state.PrimaryGroupName.Length > 0)
             {
-                _clashNodeItem.Text = "选择节点（" + state.PrimaryGroupName + " → " + state.PrimaryGroupNow + "）";
+                _clashNodeItem.Text = "选择节点（" + state.PrimaryGroupName + " → " + state.FormatNodeWithDelay(state.PrimaryGroupNow) + "）";
             }
             else
             {
@@ -355,7 +525,7 @@ namespace ChatGptProxyTray
             for (int i = 0; i < state.Groups.Count; i++)
             {
                 ClashGroup group = state.Groups[i];
-                ToolStripMenuItem groupItem = new ToolStripMenuItem(group.Name + " → " + group.Now);
+                ToolStripMenuItem groupItem = new ToolStripMenuItem(group.Name + " → " + state.FormatNodeWithDelay(group.Now));
                 if (group.Options.Count == 0)
                 {
                     ToolStripMenuItem empty = new ToolStripMenuItem("（无节点）");
@@ -365,7 +535,7 @@ namespace ChatGptProxyTray
                 for (int j = 0; j < group.Options.Count; j++)
                 {
                     string option = group.Options[j];
-                    ToolStripMenuItem optionItem = new ToolStripMenuItem(option);
+                    ToolStripMenuItem optionItem = new ToolStripMenuItem(state.FormatNodeWithDelay(option));
                     optionItem.Checked = string.Equals(option, group.Now, StringComparison.Ordinal);
                     string groupName = group.Name;
                     string nodeName = option;
@@ -378,51 +548,69 @@ namespace ChatGptProxyTray
 
         private void SetClashMode(string mode)
         {
-            string error;
-            if (!ClashApi.SetMode(_cfg, mode, out error))
+            AppConfig cfg = _cfg;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                ShowBalloon("切换 Clash 模式失败", error, ToolTipIcon.Error);
-                return;
-            }
-            RefreshClashState(true);
-            UpdateClashMenu();
-            ShowBalloon("Clash 模式已切换", ClashApi.ModeToText(mode) + "（仅当前 Clash 会话生效，重启 Clash 后恢复配置）", ToolTipIcon.Info);
-            if (mode == "global" && _clash != null && _clash.ApiAvailable &&
-                (string.Equals(_clash.GlobalNow, "DIRECT", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(_clash.GlobalNow, "REJECT", StringComparison.OrdinalIgnoreCase)))
-            {
-                ShowBalloon("全局模式提示", "GLOBAL 当前选择是 " + _clash.GlobalNow + "，全局模式会直连；请先在 Clash 里为 GLOBAL 选一个节点。", ToolTipIcon.Warning);
-            }
-            _probe = null;
-            RefreshStatus(true);
+                string error;
+                bool ok = ClashApi.SetMode(cfg, mode, out error);
+                ClashState updated = ok ? ClashApi.GetState(cfg) : null;
+                PostUi(delegate
+                {
+                    if (!ok)
+                    {
+                        ShowBalloon("切换 Clash 模式失败", error, ToolTipIcon.Error);
+                        return;
+                    }
+                    if (updated != null)
+                    {
+                        _clash = updated;
+                        _clashAt = DateTime.UtcNow;
+                    }
+                    UpdateClashMenu();
+                    if (mode == "global" && _clash != null && _clash.ApiAvailable &&
+                        (string.Equals(_clash.GlobalNow, "DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(_clash.GlobalNow, "REJECT", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        ShowBalloon("全局模式提示", "GLOBAL 当前选择是 " + _clash.GlobalNow + "，全局模式会直连；请先在 Clash 里为 GLOBAL 选一个节点。", ToolTipIcon.Warning);
+                    }
+                    else
+                    {
+                        ShowBalloon("Clash 模式已切换", ClashApi.ModeToText(mode) + "（仅当前 Clash 会话生效，重启 Clash 后恢复配置）", ToolTipIcon.Info);
+                    }
+                    _probe = null;
+                    RefreshStatusAsync(true, null);
+                });
+            });
         }
 
-        private void OnModeRule(object sender, EventArgs e)
-        {
-            SetClashMode("rule");
-        }
-
-        private void OnModeGlobal(object sender, EventArgs e)
-        {
-            SetClashMode("global");
-        }
-
-        private void OnModeDirect(object sender, EventArgs e)
-        {
-            SetClashMode("direct");
-        }
+        private void OnModeRule(object sender, EventArgs e) { SetClashMode("rule"); }
+        private void OnModeGlobal(object sender, EventArgs e) { SetClashMode("global"); }
+        private void OnModeDirect(object sender, EventArgs e) { SetClashMode("direct"); }
 
         private void OnSelectNode(string group, string node)
         {
-            string error;
-            if (!ClashApi.SelectNode(_cfg, group, node, out error))
+            AppConfig cfg = _cfg;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                ShowBalloon("切换节点失败", error, ToolTipIcon.Error);
-                return;
-            }
-            RefreshClashState(true);
-            UpdateClashMenu();
-            ShowBalloon("Clash 节点已切换", group + " → " + node + "（仅当前 Clash 会话生效，重启 Clash 后恢复）", ToolTipIcon.Info);
+                string error;
+                bool ok = ClashApi.SelectNode(cfg, group, node, out error);
+                ClashState updated = ok ? ClashApi.GetState(cfg) : null;
+                PostUi(delegate
+                {
+                    if (!ok)
+                    {
+                        ShowBalloon("切换节点失败", error, ToolTipIcon.Error);
+                        return;
+                    }
+                    if (updated != null)
+                    {
+                        _clash = updated;
+                        _clashAt = DateTime.UtcNow;
+                    }
+                    UpdateClashMenu();
+                    ShowBalloon("Clash 节点已切换", group + " → " + node + "（仅当前 Clash 会话生效，重启 Clash 后恢复）", ToolTipIcon.Info);
+                });
+            });
         }
 
         private void OnToggleTun(object sender, EventArgs e)
@@ -442,22 +630,35 @@ namespace ChatGptProxyTray
                 if (result != DialogResult.OK) return;
             }
 
-            string error;
-            if (!ClashApi.SetTun(_cfg, enable, out error))
+            AppConfig cfg = _cfg;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                ShowBalloon("设置 TUN 失败", error, ToolTipIcon.Error);
-                return;
-            }
-            RefreshClashState(true);
-            UpdateClashMenu();
-            ShowBalloon(enable ? "TUN 已开启" : "TUN 已关闭",
-                enable ? "系统流量现在由 Clash TUN 接管（仅当前会话，重启 Clash 后恢复配置）。" : "已恢复为系统代理/规则模式（仅当前会话）。", ToolTipIcon.Info);
+                string error;
+                bool ok = ClashApi.SetTun(cfg, enable, out error);
+                ClashState updated = ok ? ClashApi.GetState(cfg) : null;
+                PostUi(delegate
+                {
+                    if (!ok)
+                    {
+                        ShowBalloon("设置 TUN 失败", error, ToolTipIcon.Error);
+                        return;
+                    }
+                    if (updated != null)
+                    {
+                        _clash = updated;
+                        _clashAt = DateTime.UtcNow;
+                    }
+                    UpdateClashMenu();
+                    ShowBalloon(enable ? "TUN 已开启" : "TUN 已关闭",
+                        enable ? "系统流量现在由 Clash TUN 接管（仅当前会话，重启 Clash 后恢复配置）。" : "已恢复为系统代理/规则模式（仅当前会话）。", ToolTipIcon.Info);
+                });
+            });
         }
 
         private void OnToggleAutoLaunch(object sender, EventArgs e)
         {
             _cfg.AutoLaunchOnClash = !_cfg.AutoLaunchOnClash;
-            _cfg.SetValue("clash", "auto_launch", _cfg.AutoLaunchOnClash ? "true" : "false");
+            SaveConfigValue("clash", "auto_launch", _cfg.AutoLaunchOnClash ? "true" : "false");
             _autoLaunchArmed = true;
             UpdateClashMenu();
             ShowBalloon("自动启动", _cfg.AutoLaunchOnClash ? "Clash 就绪且 ChatGPT 未运行时会自动启动它。" : "已关闭自动启动。", ToolTipIcon.Info);
@@ -475,26 +676,37 @@ namespace ChatGptProxyTray
                 _autoLaunchArmed = true;
                 return;
             }
-            if (!_autoLaunchArmed) return;
+            if (!_autoLaunchArmed || _actionBusy) return;
             if (report.App != AppState.NotRunning) return;
 
             _autoLaunchArmed = false;
             Log.Info("Clash 就绪且 ChatGPT 未运行，自动启动 ChatGPT");
-            StartLaunch(false);
+            StartLaunchAsync(false);
         }
 
         private void InitializeOptions()
         {
-            if (AutoStart.IsEnabled() && !AutoStart.MatchesCurrentExe())
+            _autoStartEnabled = AutoStart.IsEnabled();
+            if (_autoStartEnabled && !AutoStart.MatchesCurrentExe())
             {
                 string error;
                 if (AutoStart.SetEnabled(true, out error)) Log.Info("已更新开机自启路径: " + AutoStart.CommandLine());
                 else Log.Warn("更新开机自启路径失败: " + error);
+                _autoStartEnabled = AutoStart.IsEnabled();
             }
             _itemGuard.Checked = _cfg.GuardEnabled;
             _itemGuardAuto.Checked = _cfg.GuardAutoTakeover;
-            _itemAutoStart.Checked = AutoStart.IsEnabled();
+            _itemAutoStart.Checked = _autoStartEnabled;
             _configWriteTime = GetConfigWriteTime();
+        }
+
+        private void SaveConfigValue(string section, string key, string value)
+        {
+            if (_cfg.SetValue(section, key, value))
+            {
+                // 同步更新时间戳，防止自身写配置在下一次定时器 tick 被误判为外部改动而重复重载
+                _configWriteTime = GetConfigWriteTime();
+            }
         }
 
         // ---- 状态面板 ----
@@ -514,13 +726,31 @@ namespace ChatGptProxyTray
             get { return _cfg; }
         }
 
+        internal bool AutoStartEnabled
+        {
+            get { return _autoStartEnabled; }
+        }
+
+        internal bool ActionBusy
+        {
+            get { return _actionBusy; }
+        }
+
         internal void OpenPanel()
         {
             if (_panel != null && _panel.IsDisposed) _panel = null;
             if (_panel == null) _panel = new StatusPanel(this);
             if (!_panel.Visible) _panel.Show();
             if (_panel.WindowState == FormWindowState.Minimized) _panel.WindowState = FormWindowState.Normal;
+            _panel.BringToFront();
             _panel.Activate();
+            try
+            {
+                NativeMethods.SetForegroundWindow(_panel.Handle);
+            }
+            catch
+            {
+            }
         }
 
         internal void NotifyPanelClosed()
@@ -530,9 +760,9 @@ namespace ChatGptProxyTray
             _panel = null;
         }
 
-        internal void PanelLaunch() { StartLaunch(false); }
+        internal void PanelLaunch() { StartLaunchAsync(false); }
 
-        internal void PanelRestart() { StartLaunch(true); }
+        internal void PanelRestart() { StartLaunchAsync(true); }
 
         internal void PanelClose() { OnCloseApp(null, EventArgs.Empty); }
 
@@ -559,11 +789,12 @@ namespace ChatGptProxyTray
             }
         }
 
-        private void CheckConfigReload()
+        private bool CheckConfigReload()
         {
             DateTime writeTime = GetConfigWriteTime();
-            if (writeTime == DateTime.MinValue || writeTime == _configWriteTime) return;
+            if (writeTime == DateTime.MinValue || writeTime == _configWriteTime) return false;
             ReloadConfig();
+            return true;
         }
 
         private void OnReloadConfig(object sender, EventArgs e)
@@ -584,8 +815,8 @@ namespace ChatGptProxyTray
                 _autoLaunchArmed = true;
                 _directNotified = false;
                 InitializeOptions();
-                RefreshClashState(true);
-                RefreshStatus(true);
+                RefreshClashStateAsync(true, null);
+                RefreshStatusAsync(true, null);
                 Log.Info("配置已重新加载: " + _cfg.ConfigPath);
                 ShowBalloon("配置已重新加载",
                     "代理 " + _cfg.BuildProxyUrl(_cfg.ProxyPort) + "，刷新间隔 " + _cfg.RefreshSeconds + " 秒。", ToolTipIcon.Info);
@@ -597,11 +828,8 @@ namespace ChatGptProxyTray
             }
         }
 
-        private void UpdateGuardMenu(StatusReport report)
+        private void UpdateGuardMenu()
         {
-            if (_itemTakeover == null) return;
-            _itemTakeover.Enabled = report != null &&
-                (report.App == AppState.Unproxied || report.App == AppState.ProxiedOtherPort);
             _itemGuard.Checked = _cfg.GuardEnabled;
             _itemGuardAuto.Checked = _cfg.GuardAutoTakeover;
         }
@@ -614,7 +842,9 @@ namespace ChatGptProxyTray
                 _directNotified = false;
                 return;
             }
-            if (!_cfg.GuardEnabled || _directNotified || _guardAutoRunning) return;
+            // Clash 代理尚未监听时不锁死 _directNotified，等 Clash 启动就绪后再提示/接管
+            if (!report.Proxy.PortOpen) return;
+            if (!_cfg.GuardEnabled || _directNotified || _guardAutoRunning || _actionBusy) return;
             if (DateTime.UtcNow.Subtract(_lastGuardAutoAt).TotalSeconds < 30) return;
 
             _directNotified = true;
@@ -624,22 +854,14 @@ namespace ChatGptProxyTray
             {
                 _lastGuardAutoAt = DateTime.UtcNow;
                 _guardAutoRunning = true;
-                try
-                {
-                    ShowBalloon("守护模式：正在接管", "ChatGPT 未走代理，正在重启为代理…", ToolTipIcon.Warning);
-                    StartLaunch(true);
-                }
-                finally
-                {
-                    _guardAutoRunning = false;
-                }
+                ShowBalloon("守护模式：正在接管", "ChatGPT 未走代理，正在重启为代理…", ToolTipIcon.Warning);
+                StartLaunchAsync(true, delegate { _guardAutoRunning = false; });
                 return;
             }
 
-            _lastBalloonIsGuard = true;
             ShowBalloon("ChatGPT 未走代理",
                 "检测到 ChatGPT 正在直连（可能从开始菜单启动）。点击此气泡即可重启为代理。",
-                ToolTipIcon.Warning);
+                ToolTipIcon.Warning, true);
         }
 
         private void OnBalloonClicked(object sender, EventArgs e)
@@ -648,23 +870,13 @@ namespace ChatGptProxyTray
             _lastBalloonIsGuard = false;
             if (_report == null || _report.App == AppState.NotRunning) return;
             Log.Info("用户点击气泡，执行接管");
-            StartLaunch(true);
-        }
-
-        private void OnTakeover(object sender, EventArgs e)
-        {
-            if (_report == null || _report.App == AppState.NotRunning)
-            {
-                ShowBalloon("ChatGPT 未运行", "请直接点「启动 ChatGPT（走代理）」。", ToolTipIcon.Info);
-                return;
-            }
-            StartLaunch(true);
+            StartLaunchAsync(true);
         }
 
         private void OnToggleGuard(object sender, EventArgs e)
         {
             _cfg.GuardEnabled = !_cfg.GuardEnabled;
-            _cfg.SetValue("guard", "enabled", _cfg.GuardEnabled ? "true" : "false");
+            SaveConfigValue("guard", "enabled", _cfg.GuardEnabled ? "true" : "false");
             _directNotified = false;
             _itemGuard.Checked = _cfg.GuardEnabled;
             ShowBalloon("守护模式", _cfg.GuardEnabled
@@ -675,11 +887,11 @@ namespace ChatGptProxyTray
         private void OnToggleGuardAuto(object sender, EventArgs e)
         {
             _cfg.GuardAutoTakeover = !_cfg.GuardAutoTakeover;
-            _cfg.SetValue("guard", "auto_takeover", _cfg.GuardAutoTakeover ? "true" : "false");
+            SaveConfigValue("guard", "auto_takeover", _cfg.GuardAutoTakeover ? "true" : "false");
             if (_cfg.GuardAutoTakeover && !_cfg.GuardEnabled)
             {
                 _cfg.GuardEnabled = true;
-                _cfg.SetValue("guard", "enabled", "true");
+                SaveConfigValue("guard", "enabled", "true");
             }
             _directNotified = false;
             _itemGuardAuto.Checked = _cfg.GuardAutoTakeover;
@@ -691,14 +903,15 @@ namespace ChatGptProxyTray
 
         private void OnToggleAutoStart(object sender, EventArgs e)
         {
-            bool enable = !AutoStart.IsEnabled();
+            bool enable = !_autoStartEnabled;
             string error;
             if (!AutoStart.SetEnabled(enable, out error))
             {
                 ShowBalloon("设置开机自启失败", error, ToolTipIcon.Error);
                 return;
             }
-            _itemAutoStart.Checked = AutoStart.IsEnabled();
+            _autoStartEnabled = AutoStart.IsEnabled();
+            _itemAutoStart.Checked = _autoStartEnabled;
             ShowBalloon("开机自启", enable
                 ? "已开启：登录 Windows 后自动启动托盘（HKCU Run）。"
                 : "已关闭：不再随 Windows 启动。", ToolTipIcon.Info);
@@ -706,22 +919,30 @@ namespace ChatGptProxyTray
 
         private void OnDiag(object sender, EventArgs e)
         {
-            string error;
-            string path = Diag.Collect(_cfg, out error);
-            if (path == null)
+            AppConfig cfg = _cfg;
+            ShowBalloon("正在生成诊断报告", "正在收集代理、进程与连接信息…", ToolTipIcon.Info);
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                ShowBalloon("生成诊断报告失败", error, ToolTipIcon.Error);
-                return;
-            }
-            ShowBalloon("诊断报告已生成", Path.GetFileName(path), ToolTipIcon.Info);
-            try
-            {
-                Process.Start("explorer.exe", "/select,\"" + path + "\"");
-            }
-            catch (Exception ex)
-            {
-                Log.Warn("打开诊断报告失败: " + ex.Message);
-            }
+                string error;
+                string path = Diag.Collect(cfg, out error);
+                PostUi(delegate
+                {
+                    if (path == null)
+                    {
+                        ShowBalloon("生成诊断报告失败", error, ToolTipIcon.Error);
+                        return;
+                    }
+                    ShowBalloon("诊断报告已生成", Path.GetFileName(path), ToolTipIcon.Info);
+                    try
+                    {
+                        Process.Start("explorer.exe", "/select,\"" + path + "\"");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn("打开诊断报告失败: " + ex.Message);
+                    }
+                });
+            });
         }
 
         private void SetIcon(Color color, string tooltip)
@@ -775,46 +996,115 @@ namespace ChatGptProxyTray
                 return;
             }
             bool running = _report != null && _report.App != AppState.NotRunning;
-            StartLaunch(running);
+            StartLaunchAsync(running);
         }
 
-        private void StartLaunch(bool restart)
+        private void StartLaunchAsync(bool restart)
         {
-            ProxyProbeResult probe = GetProbe(true);
-            if (!probe.PortOpen)
+            StartLaunchAsync(restart, null);
+        }
+
+        private void StartLaunchAsync(bool restart, Action onFinished)
+        {
+            if (_actionBusy)
             {
-                ShowBalloon("Clash 代理不可用", "请先启动 Clash，当前 " + _cfg.BuildProxyUrl(_cfg.ProxyPort) + " 未监听。", ToolTipIcon.Error);
+                if (onFinished != null) onFinished();
                 return;
             }
+            _actionBusy = true;
+            UpdateActionButtons();
 
-            try
+            AppConfig cfg = _cfg;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                List<ProcEntry> processes = AppProcess.Query();
-                if (processes.Count > 0)
+                ProxyProbeResult probe = null;
+                string launchedProxyUrl = "";
+                string errorTitle = "";
+                string errorMessage = "";
+                ToolTipIcon errorIcon = ToolTipIcon.Error;
+                bool launched = false;
+
+                try
                 {
-                    if (!restart)
+                    probe = ClashProbe.Detect(cfg);
+                    if (!probe.PortOpen)
                     {
-                        ShowBalloon("ChatGPT 已在运行", "当前没有走代理，请使用菜单「重启为代理」。", ToolTipIcon.Warning);
-                        return;
+                        errorTitle = "Clash 代理不可用";
+                        errorMessage = "请先启动 Clash，当前 " + cfg.BuildProxyUrl(cfg.ProxyPort) + " 未监听。";
                     }
-                    Log.Info("重启前关闭 ChatGPT，进程数=" + processes.Count);
-                    AppProcess.CloseAll(processes, 10000);
-                    Thread.Sleep(800);
+                    else
+                    {
+                        List<ProcEntry> processes = AppProcess.FilterLifecycleProcesses(AppProcess.Query());
+                        if (processes.Count > 0)
+                        {
+                            if (!restart)
+                            {
+                                errorTitle = "ChatGPT 已在运行";
+                                errorMessage = "当前没有走代理，请使用菜单「重启为代理」。";
+                                errorIcon = ToolTipIcon.Warning;
+                            }
+                            else
+                            {
+                                Log.Info("重启前关闭 ChatGPT，进程数=" + processes.Count);
+                                AppProcess.CloseAll(processes, 10000);
+                                Thread.Sleep(500);
+                            }
+                        }
+
+                        if (errorTitle.Length == 0)
+                        {
+                            string executable;
+                            string arguments;
+                            int pid = Launcher.Launch(cfg, probe.Port, out executable, out arguments);
+                            Log.Info("启动完成 pid=" + pid);
+                            launchedProxyUrl = probe.ProxyUrl;
+                            launched = true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("启动 ChatGPT 失败", ex);
+                    errorTitle = "启动失败";
+                    errorMessage = ex.Message;
                 }
 
-                string executable;
-                string arguments;
-                int pid = Launcher.Launch(_cfg, probe.Port, out executable, out arguments);
-                Log.Info("启动完成 pid=" + pid);
-                BeginVerify();
-                ShowBalloon("已启动 ChatGPT", "代理 " + probe.ProxyUrl + "，正在验证（约 " + _cfg.VerifySeconds + " 秒）…", ToolTipIcon.Info);
-                RefreshStatus(true);
-            }
-            catch (Exception ex)
+                PostUi(delegate
+                {
+                    _actionBusy = false;
+                    if (probe != null)
+                    {
+                        _probe = probe;
+                        _probeAt = DateTime.UtcNow;
+                    }
+                    UpdateActionButtons();
+                    if (launched)
+                    {
+                        BeginVerify();
+                        ShowBalloon("已启动 ChatGPT", "代理 " + launchedProxyUrl + "，正在验证（约 " + _cfg.VerifySeconds + " 秒）…", ToolTipIcon.Info);
+                        RefreshStatusAsync(false, null);
+                    }
+                    else if (errorTitle.Length > 0)
+                    {
+                        ShowBalloon(errorTitle, errorMessage, errorIcon);
+                    }
+                    if (onFinished != null) onFinished();
+                });
+            });
+        }
+
+        private void UpdateActionButtons()
+        {
+            if (_report == null) return;
+            if (_report.App == AppState.Proxied)
             {
-                Log.Error("启动 ChatGPT 失败", ex);
-                ShowBalloon("启动失败", ex.Message, ToolTipIcon.Error);
+                _itemLaunch.Enabled = false;
             }
+            else
+            {
+                _itemLaunch.Enabled = !_actionBusy;
+            }
+            _itemClose.Enabled = !_actionBusy && _report.App != AppState.NotRunning;
         }
 
         private void BeginVerify()
@@ -828,8 +1118,10 @@ namespace ChatGptProxyTray
         {
             _verifyTimer.Stop();
             _probe = null;
-            RefreshStatus(true);
-            ShowVerificationBalloon(_report);
+            RefreshStatusAsync(true, delegate(StatusReport report)
+            {
+                ShowVerificationBalloon(report);
+            });
         }
 
         private void ShowVerificationBalloon(StatusReport report)
@@ -867,7 +1159,8 @@ namespace ChatGptProxyTray
 
         private void OnCloseApp(object sender, EventArgs e)
         {
-            List<ProcEntry> processes = AppProcess.Query();
+            if (_actionBusy) return;
+            List<ProcEntry> processes = AppProcess.FilterLifecycleProcesses(AppProcess.Query());
             if (processes.Count == 0)
             {
                 ShowBalloon("ChatGPT 未运行", "没有需要关闭的进程。", ToolTipIcon.Info);
@@ -877,29 +1170,58 @@ namespace ChatGptProxyTray
                 "确定要关闭 ChatGPT 吗？\n\n正在生成的内容和未发送的输入会丢失。",
                 "关闭 ChatGPT", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
             if (confirm != DialogResult.OK) return;
-            AppProcess.CloseAll(processes, 10000);
-            _probe = null;
-            RefreshStatus(true);
-            ShowBalloon("已关闭 ChatGPT", "进程已全部退出。", ToolTipIcon.Info);
+
+            // 用户显式手动关闭 ChatGPT 后，解除本轮自动启动触发，避免 3 秒后被自动拉起
+            _autoLaunchArmed = false;
+            _actionBusy = true;
+            UpdateActionButtons();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool ok = false;
+                try
+                {
+                    ok = AppProcess.CloseAll(processes, 10000);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("关闭 ChatGPT 失败", ex);
+                }
+
+                PostUi(delegate
+                {
+                    _actionBusy = false;
+                    UpdateActionButtons();
+                    _probe = null;
+                    RefreshStatusAsync(true, null);
+                    ShowBalloon(ok ? "已关闭 ChatGPT" : "关闭未完全结束",
+                        ok ? "进程已全部退出。" : "仍有部分残留进程，请查看日志。",
+                        ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+                });
+            });
         }
 
         private void OnDetect(object sender, EventArgs e)
         {
-            RefreshClashState(true);
+            RefreshClashStateAsync(true, null);
             _probe = null;
-            RefreshStatus(true);
-            if (_report == null) return;
-            string message = _report.Proxy.PortOpen
-                ? "端口 " + _report.Proxy.Port + " 已监听，CONNECT 验证：" + _report.Proxy.Detail
-                : _report.Proxy.Detail;
-            ShowBalloon("Clash 检测", message, _report.Proxy.PortOpen ? ToolTipIcon.Info : ToolTipIcon.Error);
+            RefreshStatusAsync(true, delegate(StatusReport report)
+            {
+                if (report == null) return;
+                string message = report.Proxy.PortOpen
+                    ? "端口 " + report.Proxy.Port + " 已监听，CONNECT 验证：" + report.Proxy.Detail
+                    : report.Proxy.Detail;
+                ToolTipIcon icon = !report.Proxy.PortOpen
+                    ? ToolTipIcon.Error
+                    : (report.Proxy.TunnelOk ? ToolTipIcon.Info : ToolTipIcon.Warning);
+                ShowBalloon("Clash 检测", message, icon);
+            });
         }
 
         private void OnOpenConfig(object sender, EventArgs e)
         {
             try
             {
-                if (!File.Exists(_cfg.ConfigPath)) File.WriteAllText(_cfg.ConfigPath, "", Encoding.UTF8);
+                if (!File.Exists(_cfg.ConfigPath)) AppConfig.Load();
                 Process.Start("notepad.exe", "\"" + _cfg.ConfigPath + "\"");
             }
             catch (Exception ex)
@@ -933,6 +1255,12 @@ namespace ChatGptProxyTray
 
         private void ShowBalloon(string title, string text, ToolTipIcon icon)
         {
+            ShowBalloon(title, text, icon, false);
+        }
+
+        private void ShowBalloon(string title, string text, ToolTipIcon icon, bool isGuard)
+        {
+            _lastBalloonIsGuard = isGuard;
             try
             {
                 _icon.BalloonTipTitle = title;
@@ -950,6 +1278,17 @@ namespace ChatGptProxyTray
         {
             if (disposing)
             {
+                _disposed = true;
+                if (_wakeupWaitHandle != null)
+                {
+                    try { _wakeupWaitHandle.Unregister(null); } catch { }
+                    _wakeupWaitHandle = null;
+                }
+                if (_wakeupEvent != null)
+                {
+                    try { _wakeupEvent.Close(); } catch { }
+                    _wakeupEvent = null;
+                }
                 if (_timer != null)
                 {
                     _timer.Stop();
@@ -971,6 +1310,7 @@ namespace ChatGptProxyTray
                     _panel.Dispose();
                     _panel = null;
                 }
+                if (_invoker != null) _invoker.Dispose();
                 foreach (Icon icon in _icons.Values) icon.Dispose();
                 _icons.Clear();
             }

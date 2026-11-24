@@ -10,6 +10,14 @@ namespace ChatGptProxyTray
     // 状态面板：实时显示代理/ChatGPT/Clash 状态，并列出经过 Clash 的连接与规则命中。
     internal sealed class StatusPanel : Form
     {
+        private sealed class BufferedListView : ListView
+        {
+            public BufferedListView()
+            {
+                DoubleBuffered = true;
+            }
+        }
+
         private readonly TrayContext _context;
         private readonly System.Windows.Forms.Timer _timer;
         private readonly Label _labelProxy;
@@ -18,51 +26,64 @@ namespace ChatGptProxyTray
         private readonly Label _labelClash;
         private readonly Label _labelGuard;
         private readonly Label _labelStatus;
-        private readonly ListView _list;
+        private readonly BufferedListView _list;
         private readonly Button _buttonStart;
         private readonly Button _buttonRestart;
         private readonly Button _buttonClose;
         private DateTime _lastConnectionsAt = DateTime.MinValue;
         private bool _loadingConnections;
+        private int _lastLoggedCount = -1;
+        private string _lastLoggedError;
 
         public StatusPanel(TrayContext context)
         {
             _context = context;
             Text = "ChatGPT 代理助手 · 状态面板";
             StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.FixedSingle;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MinimumSize = new Size(760, 460);
+            MaximizeBox = true;
+            MinimizeBox = true;
+            ShowInTaskbar = true;
             ClientSize = new Size(820, 542);
             Font = new Font("Microsoft YaHei UI", 9f);
+            try
+            {
+                Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch
+            {
+            }
 
-            _labelProxy = AddLabel(12, 12, 790);
-            _labelApp = AddLabel(12, 36, 790);
-            _labelConnections = AddLabel(12, 60, 790);
-            _labelClash = AddLabel(12, 84, 790);
-            _labelGuard = AddLabel(12, 108, 790);
+            _labelProxy = AddLabel(12, 12, 796);
+            _labelApp = AddLabel(12, 36, 796);
+            _labelConnections = AddLabel(12, 60, 796);
+            _labelClash = AddLabel(12, 84, 796);
+            _labelGuard = AddLabel(12, 108, 796);
 
-            Label caption = AddLabel(12, 138, 790);
-            caption.Text = "连接与规则命中（来自 Clash /connections，只显示 ChatGPT / codex 的活跃连接）";
+            Label caption = AddLabel(12, 138, 796);
+            caption.Text = "连接与规则命中（来自 Clash /connections，只显示 ChatGPT / codex 的活跃连接；右键可复制）";
 
-            _list = new ListView();
+            _list = new BufferedListView();
             _list.Location = new Point(12, 160);
             _list.Size = new Size(796, 296);
+            _list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             _list.View = View.Details;
             _list.FullRowSelect = true;
             _list.GridLines = true;
             _list.HideSelection = false;
             _list.MultiSelect = false;
-            _list.Columns.Add("进程", 100);
+            _list.Columns.Add("进程", 110);
             _list.Columns.Add("目标", 230);
             _list.Columns.Add("规则", 130);
             _list.Columns.Add("代理链", 170);
-            _list.Columns.Add("上行", 70, HorizontalAlignment.Right);
-            _list.Columns.Add("下行", 70, HorizontalAlignment.Right);
+            _list.Columns.Add("上行", 72, HorizontalAlignment.Right);
+            _list.Columns.Add("下行", 72, HorizontalAlignment.Right);
+            _list.ContextMenuStrip = BuildListMenu();
             Controls.Add(_list);
 
-            _labelStatus = AddLabel(12, 468, 520);
+            _labelStatus = AddLabel(12, 468, 796);
+            _labelStatus.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
             Button refresh = AddButton("刷新连接", 12, 494, 90);
             _buttonStart = AddButton("启动 ChatGPT", 110, 494, 118);
@@ -70,7 +91,8 @@ namespace ChatGptProxyTray
             _buttonClose = AddButton("关闭 ChatGPT", 352, 494, 108);
             Button diag = AddButton("生成诊断", 468, 494, 90);
             Button logs = AddButton("打开日志", 566, 494, 90);
-            Button closePanel = AddButton("关闭面板", 664, 494, 90);
+            Button closePanel = AddButton("关闭面板", 718, 494, 90);
+            closePanel.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
 
             refresh.Click += OnRefreshConnections;
             _buttonStart.Click += OnStart;
@@ -90,6 +112,56 @@ namespace ChatGptProxyTray
             Log.Info("状态面板已打开");
         }
 
+        private ContextMenuStrip BuildListMenu()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Items.Add("复制目标", null, delegate { CopySelectedColumn(1); });
+            menu.Items.Add("复制规则", null, delegate { CopySelectedColumn(2); });
+            menu.Items.Add("复制代理链", null, delegate { CopySelectedColumn(3); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("复制整行", null, delegate { CopySelectedRow(); });
+            menu.Opening += delegate
+            {
+                bool hasSelection = _list.SelectedItems.Count > 0;
+                for (int i = 0; i < menu.Items.Count; i++)
+                {
+                    if (!(menu.Items[i] is ToolStripSeparator)) menu.Items[i].Enabled = hasSelection;
+                }
+            };
+            return menu;
+        }
+
+        private void CopySelectedColumn(int columnIndex)
+        {
+            if (_list.SelectedItems.Count == 0) return;
+            ListViewItem item = _list.SelectedItems[0];
+            if (columnIndex < 0 || columnIndex >= item.SubItems.Count) return;
+            string text = item.SubItems[columnIndex].Text;
+            if (!string.IsNullOrEmpty(text)) CopyText(text);
+        }
+
+        private void CopySelectedRow()
+        {
+            if (_list.SelectedItems.Count == 0) return;
+            ListViewItem item = _list.SelectedItems[0];
+            string[] parts = new string[item.SubItems.Count];
+            for (int i = 0; i < item.SubItems.Count; i++) parts[i] = item.SubItems[i].Text;
+            CopyText(string.Join("\t", parts));
+        }
+
+        private void CopyText(string text)
+        {
+            try
+            {
+                Clipboard.SetText(text);
+                _labelStatus.Text = "已复制到剪贴板: " + (text.Length > 60 ? text.Substring(0, 60) + "…" : text);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("写入剪贴板失败: " + ex.Message);
+            }
+        }
+
         private void OnPanelShown(object sender, EventArgs e)
         {
             UpdateFromContext();
@@ -101,7 +173,9 @@ namespace ChatGptProxyTray
             Label label = new Label();
             label.Location = new Point(x, y);
             label.Size = new Size(width, 20);
+            label.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             label.AutoSize = false;
+            label.AutoEllipsis = true;
             label.Text = "";
             Controls.Add(label);
             return label;
@@ -113,6 +187,7 @@ namespace ChatGptProxyTray
             button.Text = text;
             button.Location = new Point(x, y);
             button.Size = new Size(width, 30);
+            button.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             Controls.Add(button);
             return button;
         }
@@ -135,9 +210,19 @@ namespace ChatGptProxyTray
                 return;
             }
 
-            _labelProxy.Text = report.Proxy.PortOpen
-                ? "代理: " + report.Proxy.ProxyUrl + "  可用（" + report.Proxy.Detail + "）"
-                : "代理: " + (report.Proxy.ProxyUrl.Length > 0 ? report.Proxy.ProxyUrl : cfg.BuildProxyUrl(cfg.ProxyPort)) + "  不可用（" + report.Proxy.Detail + "）";
+            string proxyUrl = report.Proxy.ProxyUrl.Length > 0 ? report.Proxy.ProxyUrl : cfg.BuildProxyUrl(cfg.ProxyPort);
+            if (!report.Proxy.PortOpen)
+            {
+                _labelProxy.Text = "代理: " + proxyUrl + "  不可用（" + report.Proxy.Detail + "）";
+            }
+            else if (!report.Proxy.TunnelOk)
+            {
+                _labelProxy.Text = "代理: " + proxyUrl + "  端口通/验证失败（" + report.Proxy.Detail + "）";
+            }
+            else
+            {
+                _labelProxy.Text = "代理: " + proxyUrl + "  可用（" + report.Proxy.Detail + "）";
+            }
 
             _labelApp.Text = "ChatGPT: " + report.AppStateText +
                 (report.CodexPresent ? (report.CodexViaProxy ? "  ·  codex 已走代理" : "  ·  codex 存在但暂未走代理") : "");
@@ -152,7 +237,7 @@ namespace ChatGptProxyTray
             }
             else if (clash == null)
             {
-                _labelClash.Text = "Clash: 尚未检测";
+                _labelClash.Text = "Clash: 正在检测…";
             }
             else if (!clash.ApiAvailable)
             {
@@ -162,18 +247,19 @@ namespace ChatGptProxyTray
             {
                 string text = "Clash: " + clash.Version + "  ·  " + clash.ModeText;
                 if (clash.TunEnabled) text += "  ·  TUN 开";
-                if (clash.PrimaryGroupName.Length > 0) text += "  ·  " + clash.PrimaryGroupName + " → " + clash.PrimaryGroupNow;
+                if (clash.PrimaryGroupName.Length > 0) text += "  ·  " + clash.PrimaryGroupName + " → " + clash.FormatNodeWithDelay(clash.PrimaryGroupNow);
                 text += "  ·  GLOBAL " + clash.GlobalNow;
                 _labelClash.Text = text;
             }
 
             _labelGuard.Text = "守护: " + (cfg.GuardEnabled ? "开" : "关") +
                 "  ·  自动接管: " + (cfg.GuardAutoTakeover ? "开" : "关") +
-                "  ·  开机自启: " + (AutoStart.IsEnabled() ? "开" : "关");
+                "  ·  开机自启: " + (_context.AutoStartEnabled ? "开" : "关");
 
-            _buttonStart.Enabled = report.App != AppState.Proxied;
-            _buttonRestart.Enabled = report.App != AppState.NotRunning;
-            _buttonClose.Enabled = report.App != AppState.NotRunning;
+            bool busy = _context.ActionBusy;
+            _buttonStart.Enabled = !busy && report.App != AppState.Proxied;
+            _buttonRestart.Enabled = !busy && report.App != AppState.NotRunning;
+            _buttonClose.Enabled = !busy && report.App != AppState.NotRunning;
         }
 
         private void LoadConnections(bool force)
@@ -195,9 +281,18 @@ namespace ChatGptProxyTray
             {
                 string error = "";
                 List<ClashConnection> all = new List<ClashConnection>();
+                Dictionary<int, string> localPortMap = null;
                 try
                 {
                     all = ClashApi.GetConnections(cfg, out error);
+                    if (all.Count > 0)
+                    {
+                        List<ProcEntry> procs = AppProcess.Query();
+                        if (procs.Count > 0)
+                        {
+                            localPortMap = StatusEvaluator.BuildLocalPortProcessMap(procs, TcpTable.GetConnections());
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -208,7 +303,7 @@ namespace ChatGptProxyTray
                 {
                     if (!IsDisposed && IsHandleCreated)
                     {
-                        BeginInvoke(new MethodInvoker(delegate { ApplyConnections(all, error); }));
+                        BeginInvoke(new MethodInvoker(delegate { ApplyConnections(all, localPortMap, error); }));
                         posted = true;
                     }
                 }
@@ -219,27 +314,59 @@ namespace ChatGptProxyTray
             });
         }
 
-        private void ApplyConnections(List<ClashConnection> all, string error)
+        private static string BuildConnectionKey(ClashConnection connection)
+        {
+            if (!string.IsNullOrEmpty(connection.Id)) return connection.Id;
+            return connection.Process + "|" + connection.SourcePort + "|" + connection.TargetText + "|" + connection.Start;
+        }
+
+        private void ApplyConnections(List<ClashConnection> all, Dictionary<int, string> localPortMap, string error)
         {
             _loadingConnections = false;
             _lastConnectionsAt = DateTime.UtcNow;
+
+            string selectedKey = null;
+            if (_list.SelectedItems.Count > 0)
+            {
+                selectedKey = _list.SelectedItems[0].Tag as string;
+            }
+            int topIndex = _list.TopItem != null ? _list.TopItem.Index : -1;
+
             _list.BeginUpdate();
             try
             {
                 _list.Items.Clear();
                 int count = 0;
+                ListViewItem restoredSelection = null;
                 for (int i = 0; i < all.Count; i++)
                 {
                     ClashConnection connection = all[i];
-                    if (!IsAppProcess(connection.Process)) continue;
-                    ListViewItem item = new ListViewItem(string.IsNullOrEmpty(connection.Process) ? "未知" : connection.Process);
+                    string processName = StatusEvaluator.ResolveConnectionProcess(connection, localPortMap);
+                    if (string.IsNullOrEmpty(processName)) continue;
+                    ListViewItem item = new ListViewItem(processName);
                     item.SubItems.Add(connection.TargetText);
                     item.SubItems.Add(connection.RuleText);
                     item.SubItems.Add(connection.ChainText);
                     item.SubItems.Add(FormatBytes(connection.Upload));
                     item.SubItems.Add(FormatBytes(connection.Download));
+                    string key = BuildConnectionKey(connection);
+                    item.Tag = key;
                     _list.Items.Add(item);
+                    if (selectedKey != null && string.Equals(selectedKey, key, StringComparison.Ordinal))
+                    {
+                        restoredSelection = item;
+                    }
                     count++;
+                }
+
+                if (restoredSelection != null)
+                {
+                    restoredSelection.Selected = true;
+                    restoredSelection.Focused = true;
+                }
+                if (topIndex >= 0 && topIndex < _list.Items.Count)
+                {
+                    try { _list.TopItem = _list.Items[topIndex]; } catch { }
                 }
 
                 if (count == 0)
@@ -252,19 +379,18 @@ namespace ChatGptProxyTray
                 {
                     _labelStatus.Text = "命中 " + count + " 条连接  ·  更新于 " + DateTime.Now.ToString("HH:mm:ss");
                 }
-                Log.Info("面板连接已更新: 命中 " + count + " 条" + (string.IsNullOrEmpty(error) ? "" : "，错误: " + error));
+
+                if (count != _lastLoggedCount || !string.Equals(error, _lastLoggedError, StringComparison.Ordinal))
+                {
+                    _lastLoggedCount = count;
+                    _lastLoggedError = error;
+                    Log.Info("面板连接已更新: 命中 " + count + " 条" + (string.IsNullOrEmpty(error) ? "" : "，错误: " + error));
+                }
             }
             finally
             {
                 _list.EndUpdate();
             }
-        }
-
-        private static bool IsAppProcess(string process)
-        {
-            if (string.IsNullOrEmpty(process)) return false;
-            return process.IndexOf("chatgpt", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   process.IndexOf("codex", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string FormatBytes(long bytes)
@@ -274,28 +400,6 @@ namespace ChatGptProxyTray
             return (bytes / 1024.0 / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " MB";
         }
 
-        private void RunTrayAction(Action action, string description)
-        {
-            try
-            {
-                Cursor = Cursors.WaitCursor;
-                _labelStatus.Text = description + "…";
-                _labelStatus.Refresh();
-                Application.DoEvents();
-                action();
-            }
-            catch (Exception ex)
-            {
-                Log.Error("面板操作失败: " + description, ex);
-                MessageBox.Show(ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-                UpdateFromContext();
-            }
-        }
-
         private void OnRefreshConnections(object sender, EventArgs e)
         {
             LoadConnections(true);
@@ -303,27 +407,33 @@ namespace ChatGptProxyTray
 
         private void OnStart(object sender, EventArgs e)
         {
-            RunTrayAction(_context.PanelLaunch, "启动 ChatGPT");
+            _labelStatus.Text = "正在启动 ChatGPT…";
+            _context.PanelLaunch();
+            UpdateFromContext();
         }
 
         private void OnRestart(object sender, EventArgs e)
         {
-            RunTrayAction(_context.PanelRestart, "重启 ChatGPT");
+            _labelStatus.Text = "正在重启 ChatGPT 为代理…";
+            _context.PanelRestart();
+            UpdateFromContext();
         }
 
         private void OnCloseApp(object sender, EventArgs e)
         {
-            RunTrayAction(_context.PanelClose, "关闭 ChatGPT");
+            _context.PanelClose();
+            UpdateFromContext();
         }
 
         private void OnDiag(object sender, EventArgs e)
         {
-            RunTrayAction(_context.PanelDiag, "生成诊断报告");
+            _labelStatus.Text = "正在生成诊断报告…";
+            _context.PanelDiag();
         }
 
         private void OnOpenLogs(object sender, EventArgs e)
         {
-            RunTrayAction(_context.PanelOpenLogs, "打开日志目录");
+            _context.PanelOpenLogs();
         }
 
         private void OnClosePanel(object sender, EventArgs e)

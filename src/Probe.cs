@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace ChatGptProxyTray
 {
@@ -27,6 +29,12 @@ namespace ChatGptProxyTray
                 if (!candidates.Contains(cfg.FallbackPorts[i])) candidates.Add(cfg.FallbackPorts[i]);
             }
 
+            string verifyHost;
+            int verifyPort;
+            ParseVerifyTarget(cfg.VerifyHost, out verifyHost, out verifyPort);
+
+            ProxyProbeResult firstOpenFailure = null;
+
             for (int i = 0; i < candidates.Count; i++)
             {
                 int port = candidates[i];
@@ -39,22 +47,50 @@ namespace ChatGptProxyTray
                 if (cfg.VerifyConnect)
                 {
                     string detail;
-                    result.TunnelOk = TestConnect(cfg.ProxyHost, port, "chatgpt.com", 443, 3000, out detail);
+                    result.TunnelOk = TestConnect(cfg.ProxyHost, port, verifyHost, verifyPort, 3000, out detail);
                     result.Detail = detail;
+                    if (result.TunnelOk) return result;
+                    if (firstOpenFailure == null) firstOpenFailure = result;
+                    continue;
                 }
                 else
                 {
                     result.TunnelOk = true;
                     result.Detail = "未启用 CONNECT 验证";
+                    return result;
                 }
-                return result;
             }
+
+            if (firstOpenFailure != null) return firstOpenFailure;
 
             ProxyProbeResult none = new ProxyProbeResult();
             none.PortOpen = false;
             none.Port = cfg.ProxyPort;
             none.Detail = "端口 " + cfg.ProxyHost + ":" + cfg.ProxyPort + " 未监听";
             return none;
+        }
+
+        private static void ParseVerifyTarget(string raw, out string host, out int port)
+        {
+            host = "chatgpt.com";
+            port = 443;
+            if (string.IsNullOrEmpty(raw)) return;
+            string trimmed = raw.Trim();
+            if (trimmed.Length == 0) return;
+
+            int colon = trimmed.LastIndexOf(':');
+            if (colon > 0 && colon < trimmed.Length - 1 && trimmed.IndexOf(']') < colon)
+            {
+                int parsedPort;
+                if (int.TryParse(trimmed.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedPort) &&
+                    parsedPort > 0 && parsedPort <= 65535)
+                {
+                    host = trimmed.Substring(0, colon).Trim();
+                    port = parsedPort;
+                    return;
+                }
+            }
+            host = trimmed;
         }
 
         public static bool IsPortOpen(string host, int port, int timeoutMs)
@@ -64,9 +100,21 @@ namespace ChatGptProxyTray
                 using (TcpClient client = new TcpClient())
                 {
                     IAsyncResult asyncResult = client.BeginConnect(host, port, null, null);
-                    if (!asyncResult.AsyncWaitHandle.WaitOne(timeoutMs, false)) return false;
-                    client.EndConnect(asyncResult);
-                    return client.Connected;
+                    WaitHandle waitHandle = asyncResult.AsyncWaitHandle;
+                    try
+                    {
+                        if (!waitHandle.WaitOne(timeoutMs, false))
+                        {
+                            client.Close();
+                            return false;
+                        }
+                        client.EndConnect(asyncResult);
+                        return client.Connected;
+                    }
+                    finally
+                    {
+                        try { waitHandle.Close(); } catch { }
+                    }
                 }
             }
             catch
@@ -83,35 +131,60 @@ namespace ChatGptProxyTray
                 using (TcpClient client = new TcpClient())
                 {
                     IAsyncResult asyncResult = client.BeginConnect(proxyHost, proxyPort, null, null);
-                    if (!asyncResult.AsyncWaitHandle.WaitOne(2000, false))
+                    WaitHandle waitHandle = asyncResult.AsyncWaitHandle;
+                    try
                     {
-                        detail = "连接代理超时";
-                        return false;
+                        if (!waitHandle.WaitOne(2000, false))
+                        {
+                            client.Close();
+                            detail = "连接代理超时";
+                            return false;
+                        }
+                        client.EndConnect(asyncResult);
                     }
-                    client.EndConnect(asyncResult);
+                    finally
+                    {
+                        try { waitHandle.Close(); } catch { }
+                    }
 
                     using (NetworkStream stream = client.GetStream())
                     {
                         stream.ReadTimeout = timeoutMs;
-                        string request = string.Format("CONNECT {0}:{1} HTTP/1.1\r\nHost: {0}:{1}\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetHost, targetPort);
+                        stream.WriteTimeout = timeoutMs;
+                        string request = string.Format(CultureInfo.InvariantCulture,
+                            "CONNECT {0}:{1} HTTP/1.1\r\nHost: {0}:{1}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+                            targetHost, targetPort);
                         byte[] requestBytes = Encoding.ASCII.GetBytes(request);
                         stream.Write(requestBytes, 0, requestBytes.Length);
                         stream.Flush();
 
                         byte[] buffer = new byte[512];
-                        int read = stream.Read(buffer, 0, buffer.Length);
-                        if (read <= 0)
+                        int totalRead = 0;
+                        while (totalRead < buffer.Length)
+                        {
+                            int read = stream.Read(buffer, totalRead, buffer.Length - totalRead);
+                            if (read <= 0) break;
+                            totalRead += read;
+                            bool hasNewLine = false;
+                            for (int i = 0; i < totalRead; i++)
+                            {
+                                if (buffer[i] == (byte)'\n') { hasNewLine = true; break; }
+                            }
+                            if (hasNewLine) break;
+                        }
+                        if (totalRead <= 0)
                         {
                             detail = "代理无响应";
                             return false;
                         }
-                        string response = Encoding.ASCII.GetString(buffer, 0, read);
+                        string response = Encoding.ASCII.GetString(buffer, 0, totalRead);
                         string firstLine = response;
                         int newLine = response.IndexOf('\n');
                         if (newLine > 0) firstLine = response.Substring(0, newLine).Trim();
+                        else firstLine = response.Trim();
                         detail = firstLine;
-                        if (firstLine.IndexOf(" 200") >= 0) return true;
-                        if (firstLine.IndexOf(" 407") >= 0) detail = "代理要求认证 (407)";
+                        if (firstLine.IndexOf(" 200", StringComparison.Ordinal) >= 0) return true;
+                        if (firstLine.IndexOf(" 407", StringComparison.Ordinal) >= 0) detail = "代理要求认证 (407)";
                         return false;
                     }
                 }

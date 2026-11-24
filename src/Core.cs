@@ -47,7 +47,22 @@ namespace ChatGptProxyTray
                     }
                     string line = string.Format(CultureInfo.InvariantCulture,
                         "{0:yyyy-MM-dd HH:mm:ss.fff} [{1}] {2}{3}", DateTime.Now, level, message, Environment.NewLine);
-                    File.AppendAllText(LogFile, line, Encoding.UTF8);
+                    byte[] bytes = Encoding.UTF8.GetBytes(line);
+                    for (int attempt = 0; attempt < 2; attempt++)
+                    {
+                        try
+                        {
+                            using (FileStream stream = new FileStream(LogFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                            {
+                                stream.Write(bytes, 0, bytes.Length);
+                            }
+                            break;
+                        }
+                        catch (IOException)
+                        {
+                            if (attempt == 0) System.Threading.Thread.Sleep(20);
+                        }
+                    }
                 }
             }
             catch
@@ -64,6 +79,7 @@ namespace ChatGptProxyTray
         public string BypassList = "localhost;127.0.0.1;[::1];<local>";
         public string NoProxy = "127.0.0.1,localhost,::1";
         public bool VerifyConnect = true;
+        public string VerifyHost = "chatgpt.com:443";
         public string PackageName = "OpenAI.Codex";
         public string AliasName = "chatgpt-desktop.exe";
         public string ExePath = "";
@@ -73,20 +89,31 @@ namespace ChatGptProxyTray
         public bool GuardEnabled = true;
         public bool GuardAutoTakeover = false;
         public string ClashPipeName = "";
+        public string ClashApiUrl = "";
+        public string ClashApiSecret = "";
         public int RefreshSeconds = 3;
         public int VerifySeconds = 8;
         public string ConfigPath = "";
 
         public string BuildProxyUrl(int port)
         {
-            return string.Format(CultureInfo.InvariantCulture, "http://{0}:{1}", ProxyHost, port);
+            string host = ProxyHost;
+            if (!string.IsNullOrEmpty(host) && host.IndexOf(':') >= 0 && !host.StartsWith("[", StringComparison.Ordinal))
+            {
+                host = "[" + host + "]";
+            }
+            return string.Format(CultureInfo.InvariantCulture, "http://{0}:{1}", host, port);
         }
+
+        private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
         private const string DefaultContent =
             "# ChatGPT 代理助手配置\r\n" +
             "# 端口为 Clash Verge 的混合端口（默认 7897）\r\n" +
             "\r\n" +
             "[proxy]\r\n" +
+            "# 若 Clash 跑在局域网另一台机器上，把 host 改成对方 IP（如 192.168.1.10），\r\n" +
+            "# 并确保对方已开启「允许局域网连接」、防火墙放行该端口。\r\n" +
             "host=127.0.0.1\r\n" +
             "port=7897\r\n" +
             "# 配置端口不通时，依次尝试这些端口（逗号分隔）\r\n" +
@@ -97,6 +124,8 @@ namespace ChatGptProxyTray
             "no_proxy=127.0.0.1,localhost,::1\r\n" +
             "# 启动前用 HTTP CONNECT 验证代理是否真的能出网\r\n" +
             "verify_connect=true\r\n" +
+            "# CONNECT 验证目标主机和端口（默认 chatgpt.com:443）\r\n" +
+            "verify_host=chatgpt.com:443\r\n" +
             "\r\n" +
             "[target]\r\n" +
             "package_name=OpenAI.Codex\r\n" +
@@ -113,6 +142,11 @@ namespace ChatGptProxyTray
             "auto_launch=false\r\n" +
             "# 手动指定 mihomo API 命名管道名（留空则自动发现）\r\n" +
             "pipe_name=\r\n" +
+            "# 可选：Clash HTTP 外部控制地址（如 http://127.0.0.1:9097 或 http://192.168.1.10:9097）；\r\n" +
+            "# 填写后优先走 HTTP API（支持局域网与所有 Clash 客户端），留空则走本机命名管道\r\n" +
+            "api_url=\r\n" +
+            "# 可选：Clash HTTP 外部控制密钥（对应 external-controller 的 secret）\r\n" +
+            "api_secret=\r\n" +
             "\r\n" +
             "[guard]\r\n" +
             "# 守护模式：托盘发现 ChatGPT 运行却没走代理（例如从开始菜单启动）时弹出提示\r\n" +
@@ -133,7 +167,7 @@ namespace ChatGptProxyTray
             {
                 if (!File.Exists(path))
                 {
-                    File.WriteAllText(path, DefaultContent, Encoding.UTF8);
+                    File.WriteAllText(path, DefaultContent, Utf8NoBom);
                     Log.Info("已生成默认配置: " + path);
                     return cfg;
                 }
@@ -184,6 +218,9 @@ namespace ChatGptProxyTray
                 case "proxy.verify_connect":
                     cfg.VerifyConnect = ParseBool(value, cfg.VerifyConnect);
                     break;
+                case "proxy.verify_host":
+                    if (value.Length > 0) cfg.VerifyHost = value;
+                    break;
                 case "target.package_name":
                     if (value.Length > 0) cfg.PackageName = value;
                     break;
@@ -205,6 +242,12 @@ namespace ChatGptProxyTray
                 case "clash.pipe_name":
                     cfg.ClashPipeName = value;
                     break;
+                case "clash.api_url":
+                    cfg.ClashApiUrl = value.TrimEnd('/');
+                    break;
+                case "clash.api_secret":
+                    cfg.ClashApiSecret = value;
+                    break;
                 case "guard.enabled":
                     cfg.GuardEnabled = ParseBool(value, cfg.GuardEnabled);
                     break;
@@ -224,8 +267,14 @@ namespace ChatGptProxyTray
         {
             try
             {
+                if (!File.Exists(ConfigPath))
+                {
+                    File.WriteAllText(ConfigPath, DefaultContent, Utf8NoBom);
+                }
                 List<string> lines = new List<string>(File.ReadAllLines(ConfigPath, Encoding.UTF8));
                 bool inSection = false;
+                bool sectionFound = false;
+                int sectionInsertIndex = -1;
                 bool found = false;
                 for (int i = 0; i < lines.Count; i++)
                 {
@@ -233,9 +282,16 @@ namespace ChatGptProxyTray
                     if (line.StartsWith("[") && line.EndsWith("]"))
                     {
                         inSection = line.Substring(1, line.Length - 2).Trim().Equals(section, StringComparison.OrdinalIgnoreCase);
+                        if (inSection)
+                        {
+                            sectionFound = true;
+                            sectionInsertIndex = i + 1;
+                        }
                         continue;
                     }
                     if (!inSection) continue;
+                    if (line.Length > 0) sectionInsertIndex = i + 1;
+                    if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";")) continue;
                     int eq = line.IndexOf('=');
                     if (eq <= 0) continue;
                     if (!line.Substring(0, eq).Trim().Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
@@ -245,11 +301,18 @@ namespace ChatGptProxyTray
                 }
                 if (!found)
                 {
-                    lines.Add("");
-                    lines.Add("[" + section + "]");
-                    lines.Add(key + "=" + value);
+                    if (sectionFound && sectionInsertIndex >= 0 && sectionInsertIndex <= lines.Count)
+                    {
+                        lines.Insert(sectionInsertIndex, key + "=" + value);
+                    }
+                    else
+                    {
+                        if (lines.Count > 0 && lines[lines.Count - 1].Trim().Length > 0) lines.Add("");
+                        lines.Add("[" + section + "]");
+                        lines.Add(key + "=" + value);
+                    }
                 }
-                File.WriteAllLines(ConfigPath, lines.ToArray(), Encoding.UTF8);
+                File.WriteAllLines(ConfigPath, lines.ToArray(), Utf8NoBom);
                 return true;
             }
             catch (Exception ex)

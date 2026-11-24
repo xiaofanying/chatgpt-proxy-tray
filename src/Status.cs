@@ -16,6 +16,8 @@ namespace ChatGptProxyTray
         public int LoopbackConnections;
         public int ExternalConnections;
         public List<string> DirectRemotes = new List<string>();
+        public List<IPAddress> ProxyAddresses = new List<IPAddress>();
+        public List<TcpRow> AppConnections = new List<TcpRow>();
         public bool CodexPresent;
         public bool CodexViaProxy;
         public DateTime UpdatedAt = DateTime.Now;
@@ -65,12 +67,12 @@ namespace ChatGptProxyTray
             {
                 ProcEntry entry = report.Processes[i];
                 if (!names.ContainsKey(entry.Pid)) names.Add(entry.Pid, entry.Name);
-                if (string.Equals(entry.Name, "codex.exe", StringComparison.OrdinalIgnoreCase)) report.CodexPresent = true;
+                if (AppProcess.IsCodexProcessName(entry.Name)) report.CodexPresent = true;
             }
 
+            report.ProxyAddresses = ResolveProxyAddresses(cfg.ProxyHost);
             if (names.Count > 0)
             {
-                List<IPAddress> proxyAddresses = ResolveProxyAddresses(cfg.ProxyHost);
                 List<TcpRow> rows = TcpTable.GetConnections();
                 for (int i = 0; i < rows.Count; i++)
                 {
@@ -78,10 +80,11 @@ namespace ChatGptProxyTray
                     if (row.State != TcpStateEstablished) continue;
                     if (!names.ContainsKey(row.Pid)) continue;
 
-                    if (probe.PortOpen && MatchesProxyEndpoint(row, probe.Port, proxyAddresses))
+                    report.AppConnections.Add(row);
+                    if (probe.PortOpen && MatchesProxyEndpoint(row, probe.Port, report.ProxyAddresses))
                     {
                         report.ProxiedConnections++;
-                        if (string.Equals(names[row.Pid], "codex.exe", StringComparison.OrdinalIgnoreCase)) report.CodexViaProxy = true;
+                        if (AppProcess.IsCodexProcessName(names[row.Pid])) report.CodexViaProxy = true;
                     }
                     else if (row.IsLoopbackRemote())
                     {
@@ -102,7 +105,7 @@ namespace ChatGptProxyTray
 
         // 代理可能运行在本机（127.0.0.1），也可能运行在局域网另一台机器（如 192.168.1.10）。
         // 这里把“远端等于代理主机:端口”的连接一律算作经代理，避免局域网代理被误报成直连泄漏。
-        private static List<IPAddress> ResolveProxyAddresses(string host)
+        public static List<IPAddress> ResolveProxyAddresses(string host)
         {
             List<IPAddress> addresses = new List<IPAddress>();
             try
@@ -128,7 +131,7 @@ namespace ChatGptProxyTray
             return addresses;
         }
 
-        private static bool MatchesProxyEndpoint(TcpRow row, int proxyPort, List<IPAddress> proxyAddresses)
+        public static bool MatchesProxyEndpoint(TcpRow row, int proxyPort, List<IPAddress> proxyAddresses)
         {
             if (row.RemotePort != proxyPort) return false;
             IPAddress remote = NormalizeAddress(row.RemoteAddress);
@@ -139,6 +142,46 @@ namespace ChatGptProxyTray
                 if (proxyAddresses[i].Equals(remote)) return true;
             }
             return false;
+        }
+
+        public static Dictionary<int, string> BuildLocalPortProcessMap(List<ProcEntry> processes, List<TcpRow> rows)
+        {
+            Dictionary<int, string> pidNames = new Dictionary<int, string>();
+            if (processes != null)
+            {
+                for (int i = 0; i < processes.Count; i++)
+                {
+                    ProcEntry entry = processes[i];
+                    if (!pidNames.ContainsKey(entry.Pid)) pidNames.Add(entry.Pid, entry.Name);
+                }
+            }
+
+            Dictionary<int, string> portMap = new Dictionary<int, string>();
+            if (rows != null && pidNames.Count > 0)
+            {
+                for (int i = 0; i < rows.Count; i++)
+                {
+                    TcpRow row = rows[i];
+                    // 排除 LISTEN（State=2），其余活跃/半关闭出站连接均记录源端口用于与 Clash /connections 关联
+                    if (row.State == 2 || row.LocalPort <= 0) continue;
+                    string name;
+                    if (!pidNames.TryGetValue(row.Pid, out name)) continue;
+                    if (!portMap.ContainsKey(row.LocalPort)) portMap.Add(row.LocalPort, name);
+                }
+            }
+            return portMap;
+        }
+
+        public static string ResolveConnectionProcess(ClashConnection connection, Dictionary<int, string> localPortMap)
+        {
+            if (connection == null) return null;
+            if (AppProcess.IsTargetProcessName(connection.Process)) return connection.Process;
+            if (string.IsNullOrEmpty(connection.Process) && localPortMap != null && connection.SourcePort > 0)
+            {
+                string matched;
+                if (localPortMap.TryGetValue(connection.SourcePort, out matched)) return matched;
+            }
+            return null;
         }
 
         private static IPAddress NormalizeAddress(IPAddress address)

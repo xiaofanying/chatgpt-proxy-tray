@@ -1,6 +1,7 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$ResetConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +27,7 @@ if ($sources.Count -eq 0) {
 
 $output = Join-Path $distDir 'ChatGptProxyTray.exe'
 $iconPath = Join-Path $root 'app.ico'
+$manifestPath = Join-Path $sourceDir 'app.manifest'
 $compilerArgs = @(
     '/nologo'
     '/target:winexe'
@@ -37,6 +39,9 @@ $compilerArgs = @(
 if (Test-Path $iconPath) {
     $compilerArgs += ('/win32icon:' + $iconPath)
 }
+if (Test-Path $manifestPath) {
+    $compilerArgs += ('/win32manifest:' + $manifestPath)
+}
 $compilerArgs += $sources
 
 & $compiler $compilerArgs
@@ -45,8 +50,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $configSource = Join-Path $root 'config.ini'
-if (Test-Path $configSource) {
-    Copy-Item $configSource (Join-Path $distDir 'config.ini') -Force
+$configDest = Join-Path $distDir 'config.ini'
+if ((Test-Path $configSource) -and ($ResetConfig -or -not (Test-Path $configDest))) {
+    Copy-Item $configSource $configDest -Force
 }
 
 Write-Host ("编译成功: " + $output)
