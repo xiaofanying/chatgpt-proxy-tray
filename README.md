@@ -1,5 +1,7 @@
 # ChatGPT 代理助手（ChatGptProxyTray）
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+
 一个 Windows 托盘小工具：**只让 ChatGPT 桌面版（MSIX 应用 `OpenAI.Codex`）的网络走 Clash，不改系统代理、不需要 TUN、不需要管理员权限。**
 
 它通过「注入 Chromium 代理参数 + 代理环境变量」的方式启动 ChatGPT，所以：
@@ -219,6 +221,7 @@ Codex_Proxy/
 ├─ build.ps1                    # csc 编译脚本
 ├─ test.ps1                     # 冒烟测试（编译/自检/状态/诊断/配置/自启/托盘/启动关闭）
 ├─ config.ini                   # 默认配置
+├─ LICENSE                      # MIT 许可证
 ├─ src/
 │  ├─ Native.cs                 # P/Invoke（AttachConsole/GetExtendedTcpTable/DestroyIcon…）
 │  ├─ AutoStart.cs              # 开机自启（HKCU Run）
@@ -234,3 +237,7 @@ Codex_Proxy/
 ├─ dist/                        # 编译输出
 └─ logs/                        # 运行时日志
 ```
+
+## 许可证
+
+[MIT License](LICENSE) © 2026 xiaofanying
