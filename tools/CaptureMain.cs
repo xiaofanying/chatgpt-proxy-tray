@@ -11,7 +11,7 @@ namespace ChatGptProxyTray
 {
     // 开发用截图工具：把托盘菜单和状态面板渲染成 PNG，供 README 使用。
     // 编译（不要带 src\Program.cs，否则有两个 Main）：
-    //   csc /nologo /target:winexe /platform:x64 /utf8output /out:tools\capture.exe tools\CaptureMain.cs src\*.cs (除 Program.cs)
+    //   csc /nologo /target:winexe /platform:x64 /utf8output /win32icon:app.ico /win32manifest:src\app.manifest /out:tools\capture.exe tools\CaptureMain.cs src\*.cs (除 Program.cs)
     // 运行：
     //   tools\capture.exe docs\screenshots
     internal static class CaptureMain
@@ -21,6 +21,9 @@ namespace ChatGptProxyTray
 
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
         [DllImport("user32.dll")]
         private static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
@@ -53,39 +56,19 @@ namespace ChatGptProxyTray
             Pump(300);
             context.OpenPanel();
             Pump(2500);
-            CaptureWindow(panel.Handle, Path.Combine(outDir, "panel.png"));
+            CaptureWindow(panel.Handle, Path.Combine(outDir, "panel.png"), true);
             Log("panel.png " + panel.Width + "x" + panel.Height);
 
             panel.Hide();
-            Pump(500);
-
-            Form backdrop = new Form();
-            backdrop.FormBorderStyle = FormBorderStyle.None;
-            backdrop.StartPosition = FormStartPosition.Manual;
-            backdrop.Bounds = Screen.PrimaryScreen.WorkingArea;
-            backdrop.BackColor = Color.FromArgb(248, 248, 248);
-            backdrop.ShowInTaskbar = false;
-            backdrop.TopMost = true;
-            backdrop.Show();
-            Pump(500);
+            Pump(300);
 
             ContextMenuStrip menu = (ContextMenuStrip)GetField(context, "_menu");
-            menu.Show(new Point(backdrop.Bounds.Left + 260, backdrop.Bounds.Top + 90));
+            menu.AutoClose = false;
+            menu.Show(new Point(260, 90));
             Pump(400);
-            SetWindowPos(menu.Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
-            Pump(600);
-            Rectangle screenBounds = backdrop.Bounds;
-            using (Bitmap screen = new Bitmap(screenBounds.Width, screenBounds.Height))
-            {
-                using (Graphics graphics = Graphics.FromImage(screen))
-                {
-                    graphics.CopyFromScreen(screenBounds.Left, screenBounds.Top, 0, 0, screenBounds.Size);
-                }
-                SaveCropped(screen, backdrop.BackColor, Path.Combine(outDir, "menu.png"), 8);
-            }
-            Log("menu.png saved");
+            CaptureWindow(menu.Handle, Path.Combine(outDir, "menu.png"), false);
+            Log("menu.png " + menu.Width + "x" + menu.Height);
             menu.Close();
-            backdrop.Close();
             Pump(300);
 
             context.ExitThread();
@@ -109,7 +92,7 @@ namespace ChatGptProxyTray
             }
         }
 
-        private static void CaptureWindow(IntPtr handle, string path)
+        private static void CaptureWindow(IntPtr handle, string path, bool trimDwmFrame)
         {
             RECT rect;
             GetWindowRect(handle, out rect);
@@ -122,13 +105,37 @@ namespace ChatGptProxyTray
                     IntPtr hdc = graphics.GetHdc();
                     try
                     {
-                        PrintWindow(handle, hdc, 0);
+                        // PW_RENDERFULLCONTENT (2) 可在 Windows 10/11 下正确渲染现代窗口标题栏与内容
+                        PrintWindow(handle, hdc, 2);
                     }
                     finally
                     {
                         graphics.ReleaseHdc(hdc);
                     }
                 }
+
+                if (trimDwmFrame)
+                {
+                    RECT frame;
+                    const int DwmwaExtendedFrameBounds = 9;
+                    if (DwmGetWindowAttribute(handle, DwmwaExtendedFrameBounds, out frame, Marshal.SizeOf(typeof(RECT))) == 0)
+                    {
+                        int cropX = Math.Max(0, frame.Left - rect.Left);
+                        int cropY = Math.Max(0, frame.Top - rect.Top);
+                        int cropW = Math.Min(width - cropX, Math.Max(1, frame.Right - frame.Left));
+                        int cropH = Math.Min(height - cropY, Math.Max(1, frame.Bottom - frame.Top));
+                        if (cropX > 0 || cropY > 0 || cropW < width || cropH < height)
+                        {
+                            Rectangle crop = new Rectangle(cropX, cropY, cropW, cropH);
+                            using (Bitmap trimmed = bitmap.Clone(crop, bitmap.PixelFormat))
+                            {
+                                trimmed.Save(path, ImageFormat.Png);
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 bitmap.Save(path, ImageFormat.Png);
             }
         }

@@ -41,7 +41,7 @@
 ## 快速开始
 
 ```powershell
-# 1. 编译（生成 dist\ChatGptProxyTray.exe）
+# 1. 编译（生成 dist\ChatGptProxyTray.exe；默认保留已有的 dist\config.ini，加 -ResetConfig 可重置）
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 # 2. 运行
@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File .\test.ps1
 | 打开配置文件 / 打开日志目录 | 打开 `config.ini` / `logs\` |
 | 退出 | 退出托盘 |
 
-图标颜色：**绿** = ChatGPT 已走代理；**黄** = ChatGPT 直连/端口不一致；**红** = 代理不可用或检测到疑似直连；**灰** = ChatGPT 未运行。
+图标颜色：**绿** = ChatGPT 已走代理且无直连泄漏；**黄** = ChatGPT 直连/端口不一致/出网验证失败；**红** = 代理端口不可用，或代理模式下检测到疑似直连；**灰** = ChatGPT 未运行。
 
 启动后约 8 秒会弹气泡报告验证结果（是否注入成功、有几条经代理连接、codex 核心是否继承、有无直连泄漏）。
 
@@ -97,8 +97,8 @@ ChatGptProxyTray.exe --guard-auto on|off  发现直连时自动重启为代理�
 ChatGptProxyTray.exe --autostart on|off   开机自启（HKCU Run）
 ChatGptProxyTray.exe --diag               生成诊断报告到 diag\diag-*.txt
 ChatGptProxyTray.exe --connections        打印进程连接与 Clash 规则/节点命中
-ChatGptProxyTray.exe --panel              启动托盘并打开状态面板
-ChatGptProxyTray.exe --help               帮助
+ChatGptProxyTray.exe --panel              启动托盘并打开状态面板（托盘已在运行时直接唤醒置顶）
+ChatGptProxyTray.exe --help / -h / /?     帮助
 ```
 
 结果同时写入程序目录的 `last-result.txt`；退出码：`0` 成功、`1` 失败、`2` 参数错误、`3` 已在运行、`4` 启动失败。
@@ -124,8 +124,8 @@ ChatGptProxyTray.exe --help               帮助
 6. **守护模式**：托盘每次刷新状态时，若代理已就绪且发现 ChatGPT 未走代理（直连或代理端口不一致），弹气泡提示；点击气泡或菜单「重启为代理」即可关闭并重启。也可打开「自动接管」（默认关，带 30 秒冷却）。
 7. **开机自启**：写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `ChatGptProxyTray` 值（当前 exe 路径），不需要管理员；托盘启动时如果发现记录的是旧路径（比如移动了目录），会自动更新。
 8. **诊断报告**：`--diag` 或菜单「生成诊断报告」把配置、代理探测、进程树、TCP 连接、Clash 状态、日志尾部写成一个文本文件到程序目录的 `diag\`（`api_secret` 会自动脱敏）。
-9. **状态面板**：双击托盘图标（或菜单「打开状态面板」、`--panel`，或再次运行 exe 唤醒已有实例）打开可缩放的高 DPI 面板，实时显示代理、ChatGPT、连接统计、Clash 模式/节点（含延迟）和守护开关；通过 `/connections` 列出 ChatGPT / codex 每条活跃连接命中的规则、代理链和上下行字节，列表双缓冲防闪烁、刷新时保留选中行与滚动位置，并支持右键复制目标/规则/代理链。
-10. **连接与命中查看**：`--connections` 在命令行输出同样两份数据——进程自己到 `127.0.0.1:7897` 的 ESTABLISHED 连接（区分「经代理 / 本地 / 直连!」），以及 Clash 侧每条连接的「规则 + 代理链」，用来确认流量到底走了哪个节点。
+9. **状态面板**：双击托盘图标（或菜单「打开状态面板」、`--panel`，或再次运行 exe 唤醒已有实例）打开可缩放的高 DPI 面板，实时显示代理、ChatGPT、连接统计、Clash 模式/节点（含延迟）和守护开关；通过 `/connections` 列出 ChatGPT / codex 每条活跃连接命中的规则、代理链和上下行字节（**即使 Clash 未开启 `find-process-mode` 导致 `metadata.process` 为空，也会通过本机 TCP 连接表的源端口自动反查所属进程**），列表双缓冲防闪烁、刷新时保留选中行与滚动位置，并支持右键复制目标/规则/代理链。
+10. **连接与命中查看**：`--connections` 在命令行输出同样两份数据——进程自己到代理端点的 ESTABLISHED 连接（区分「经代理 / 本地 / 直连!」），以及 Clash 侧每条连接的「进程 + 规则 + 代理链」（同样支持源端口反查），用来确认流量到底走了哪个节点。
 11. **配置热重载**：托盘每次刷新时检查 `config.ini` 的修改时间，变了就重新加载（代理端口、守护、Clash、UI 段全部生效），菜单里也有「重新加载配置」手动触发；改配置不需要重启托盘。
 
 ## 配置（config.ini）
@@ -223,15 +223,16 @@ verify_seconds=8
 - 自动接管：开启 `--guard-auto on` 并重启托盘 → 30 秒内自动关闭直连实例并以代理方式重启，`--status` 回到 `Proxied`（`经代理=16 外部=0`，codex 走代理）；
 - `--diag`：生成约 5.7 KB 的 `diag\diag-*.txt`，包含配置、代理探测、进程、TCP 连接、Clash 状态与日志尾部；
 - `--autostart on/off`：注册表 `HKCU\...\Run\ChatGptProxyTray` 写入当前 exe 路径，关闭后删除；
-- 第二个实例：静默退出（只写日志），不再弹模态框；
-- `test.ps1`：一条命令跑完 8 组共 40+ 项冒烟测试，全部通过。
-- `--connections`：列出 `ChatGPT.exe / codex.exe` 到 `127.0.0.1:7897` 的 ESTABLISHED 连接，并从 Clash `/connections` 读到命中 `DomainSuffix/google.com`、链路 `🇭🇰 V香港 10 > 自动选择 > 默认节点` 及上下行字节；
-- 状态面板：`--panel` 打开后窗口标题为 `ChatGPT 代理助手 · 状态面板`（可见），`Shown` 后自动拉取连接列表（日志「面板连接已更新: 命中 N 条」），之后每秒刷新；
-- 配置热重载：托盘运行中把 `dist\config.ini` 的 `refresh_seconds` 从 3 改成 6、再改回，日志各出现一次「配置已重新加载」，托盘无需重启；
+- 单实例唤醒：托盘运行中再次启动或执行 `--panel`，直接唤醒置顶已有状态面板并正常退出（无模态框）；
+- `test.ps1`：一条命令跑完 8 组共 45 项冒烟测试，全部通过（0 失败）；
+- `--connections` 与状态面板源端口反查：即使 Clash 未开启 `find-process-mode`（`metadata.process` 为空），仍通过本机 TCP 源端口精准反查全部 25/25 条 `ChatGPT.exe` / `codex.exe` 连接，完整列出域名、规则、代理链与上下行字节；
+- Session 0 隔离：本机常驻 `codex-windows-sandbox-service.exe`（Session 0 系统服务）时不再误判为直连残留；
+- 状态面板：`--panel` 打开高 DPI 可缩放窗口（带应用图标、双缓冲不闪烁、右键复制），`Shown` 后自动拉取连接列表（日志仅在命中数或错误变化时记录，不再刷屏）；
+- 配置热重载：托盘运行中把 `dist\config.ini` 的 `refresh_seconds` 从 3 改成 6、再改回，日志各出现一次「配置已重新加载」，托盘无需重启；通过菜单开关写配置不再误触发二次重载；
 - 托盘双击：弹出状态面板；单击不响应（避免误触，面板不常用时不会误开）；
-- 启动菜单项智能切换：ChatGPT 未运行时显示「启动 ChatGPT（走代理）」，检测到直连运行时变成「重启为代理」，已走代理时显示「ChatGPT 已走代理」并禁用；
-- 关闭确认：点「关闭 ChatGPT」会先弹确认框（默认焦点在「取消」），避免误关丢失正在生成的内容；
-- Clash 模式 / 节点 / TUN 切换后的气泡会注明「仅当前 Clash 会话生效，重启 Clash 后恢复配置」；
+- 启动菜单项智能切换：ChatGPT 未运行时显示「启动 ChatGPT（走代理）」，检测到直连运行时托盘变黄并切换为「重启为代理（接管当前实例）」，已走代理时显示「ChatGPT 已走代理」并禁用；
+- 关闭确认：点「关闭 ChatGPT」会先弹确认框（默认焦点在「取消」），避免误关丢失正在生成的内容，且手动关闭后不会在开启自动启动时被立即拉起；
+- Clash 模式 / 节点 / TUN 切换后的气泡会注明「仅当前 Clash 会话生效，重启 Clash 后恢复配置」，节点菜单附带最新测速延迟（ms）；
 
 ## 已知限制
 
